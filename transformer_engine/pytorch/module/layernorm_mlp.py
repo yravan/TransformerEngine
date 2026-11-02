@@ -1287,10 +1287,11 @@ def _layernorm_mlp_recompute(
     bwd_args.checkpoint_fwd_args = None
     final_autocast_state = FP8GlobalStateManager.get_autocast_state()
     FP8GlobalStateManager.set_autocast_state(bwd_args.autocast_state)
-    if (
+    delayed_scaling = (
         fwd_args.fp8
         and FP8GlobalStateManager.get_fp8_recipe().__class__.__name__ == "DelayedScaling"
-    ):  # only applicable for delayed scaling
+    )
+    if delayed_scaling:  # only applicable for delayed scaling
         FP8GlobalStateManager.get_old_fp8_meta_tensors_for_recompute(
             fwd_args.fp8_meta
         )  # set old quantizer state
@@ -1327,10 +1328,7 @@ def _layernorm_mlp_recompute(
         )
 
     FP8GlobalStateManager.set_autocast_state(final_autocast_state)
-    if (
-        fwd_args.fp8
-        and FP8GlobalStateManager.get_fp8_recipe().__class__.__name__ == "DelayedScaling"
-    ):
+    if delayed_scaling:
         FP8GlobalStateManager.restore_fp8_meta_tensors(fwd_args.fp8_meta)  # restore quantizers
 
     # set rng state for fwd

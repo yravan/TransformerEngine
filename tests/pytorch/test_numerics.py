@@ -2237,6 +2237,27 @@ def test_layernorm_mlp_accuracy_checkpoint(
         torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+def test_layernorm_mlp_checkpoint_updates_delayed_scaling_state():
+    """Recomputing the forward in backward must restore the FP8 meta, so a
+    checkpointed LayerNormMLP updates its scaling factor like an uncheckpointed one."""
+    fp8_recipe = recipe.DelayedScaling(reduce_amax=False)
+    scales = []
+    for checkpoint in (False, True):
+        FP8GlobalStateManager.reset()
+        torch.manual_seed(0)
+        ln_mlp = LayerNormMLP(
+            128, 256, params_dtype=torch.bfloat16, device="cuda", checkpoint=checkpoint
+        )
+        for _ in range(3):
+            inp = torch.randn(32, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+            with autocast(recipe=fp8_recipe):
+                out = ln_mlp(inp)
+            out.float().square().mean().backward()
+        scales.append(ln_mlp.fp8_meta["scaling_fwd"].scale.clone())
+    torch.testing.assert_close(scales[1], scales[0], rtol=1e-3, atol=0)
+
+
 def _test_gpt_e2e_cuda_graph(block, bs, dtype, config, graph):
     reset_rng_states()
 
