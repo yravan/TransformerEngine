@@ -2434,6 +2434,42 @@ def test_te_linear_compile_delayed_scaling_raises():
         torch.compile(fn, fullgraph=True)(inp)
 
 
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+def test_te_ops_compile_delayed_scaling_first_call_runs_eagerly():
+    """A te.ops Sequential whose first call is under torch.compile (autocast outside the
+    compiled region) with delayed scaling leaves the graph and runs eagerly: its quantizers
+    do not exist before that call, so the fuser decides after building them. Matches eager."""
+    dtype, device = torch.bfloat16, "cuda"
+    torch.manual_seed(0)
+
+    def make():
+        return te.ops.Sequential(
+            te.ops.Linear(64, 64, dtype=dtype, device=device),
+            te.ops.SwiGLU(),
+            te.ops.Linear(32, 64, dtype=dtype, device=device),
+        )
+
+    model, ref = make(), make()
+    ref.load_state_dict(model.state_dict())
+    fp8_recipe = recipe.DelayedScaling()
+    torch._dynamo.reset()
+    compiled = torch.compile(model, fullgraph=False)
+    for _ in range(2):
+        inp = torch.randn(32, 64, dtype=dtype, device=device)
+        x_c = inp.clone().requires_grad_(True)
+        x_r = inp.clone().requires_grad_(True)
+        with te.autocast(recipe=fp8_recipe):
+            out_c = compiled(x_c)
+        out_c.sum().backward()
+        with te.autocast(recipe=fp8_recipe):
+            out_r = ref(x_r)
+        out_r.sum().backward()
+        torch.testing.assert_close(out_c, out_r, atol=0, rtol=0)
+        torch.testing.assert_close(x_c.grad, x_r.grad, atol=0, rtol=0)
+        for p_c, p_r in zip(model.parameters(), ref.parameters()):
+            torch.testing.assert_close(p_c.grad, p_r.grad, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
 @pytest.mark.parametrize("compile_mode", _compile_modes)
 @pytest.mark.parametrize("deferred_backward", [False, True])

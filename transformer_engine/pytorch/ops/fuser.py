@@ -782,6 +782,24 @@ class OperationFuser:
         *extra_inputs: torch.Tensor,
         basic_op_kwargs: Optional[list[dict[str, Any]]] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        # Delayed scaling has no torch.compile path and its eager path is not traceable
+        # (quantizers that read data pointers, recipe state built on the first call), so the
+        # whole call runs outside dynamo. A graph break would not do: dynamo keeps tracing
+        # the resumed frame, including the fuser's autograd function.
+        if (
+            torch.compiler.is_compiling()
+            and FP8GlobalStateManager.is_fp8_enabled()
+            and FP8GlobalStateManager.get_fp8_recipe().delayed()
+        ):
+            return _call_eagerly(self, input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
+        return self._call_impl(input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
+
+    def _call_impl(
+        self,
+        input: torch.Tensor,  # pylint: disable=redefined-builtin
+        *extra_inputs: torch.Tensor,
+        basic_op_kwargs: Optional[list[dict[str, Any]]] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
 
         # Verify extra input count
         if len(extra_inputs) != self.num_extra_inputs:
@@ -848,6 +866,11 @@ class OperationFuser:
             return _OperationFuserAutogradFunction.forward(None, *args)
 
         return _OperationFuserAutogradFunction.apply(*args)
+
+
+@torch._dynamo.disable
+def _call_eagerly(fuser: OperationFuser, *args, **kwargs):
+    return fuser._call_impl(*args, **kwargs)
 
 
 def register_forward_backward_fusion(
