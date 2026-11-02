@@ -35,6 +35,62 @@
 namespace transformer_engine {
 namespace dispatch {
 namespace fp8 {
+
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__device__ __forceinline__ float2 splat2(const float v) { return make_float2(v, v); }
+
+// tanhf as libdevice computes it, two lanes at a time on the paired f32x2 FMA path.
+__device__ __forceinline__ float2 tanhf_x2(const float2 v) {
+  const float2 a = make_float2(fabsf(v.x), fabsf(v.y));
+  float2 e = __fmul2_rn(a, splat2(__int_as_float(0x4038AA3B)));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.x));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.y));
+  e = __fadd2_rn(e, splat2(1.f));
+  asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(e.x));
+  asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(e.y));
+  e = __ffma2_rn(e, splat2(-2.f), splat2(1.f));
+  const float big = __int_as_float(0x41102CB4);
+  e = make_float2(copysignf(a.x >= big ? 1.f : e.x, v.x), copysignf(a.y >= big ? 1.f : e.y, v.y));
+  const float2 s = __fmul2_rn(v, v);
+  float2 p = __ffma2_rn(s, splat2(__int_as_float(0x3C80F082)), splat2(__int_as_float(0xBD563CAE)));
+  p = __ffma2_rn(p, s, splat2(__int_as_float(0x3E085941)));
+  p = __ffma2_rn(p, s, splat2(__int_as_float(0xBEAAA9ED)));
+  p = __ffma2_rn(p, s, splat2(0.f));
+  p = __ffma2_rn(p, v, v);
+  const float small = __int_as_float(0x3F19999A);
+  return make_float2(a.x >= small ? e.x : p.x, a.y >= small ? e.y : p.y);
+}
+
+__device__ __forceinline__ float2 gelu_x2(const float2 c) {
+  const float2 u = __ffma2_rn(c, __fmul2_rn(c, splat2(0.03567741f)), splat2(0.79788456f));
+  const float2 t = tanhf_x2(__fmul2_rn(c, u));
+  return __fmul2_rn(c, __ffma2_rn(t, splat2(0.5f), splat2(0.5f)));
+}
+
+__device__ __forceinline__ float2 dgelu_x2(const float2 c) {
+  const float2 u = __ffma2_rn(c, __fmul2_rn(c, splat2(0.044715f)), splat2(1.f));
+  const float2 t = tanhf_x2(__fmul2_rn(__fmul2_rn(c, splat2(0.79788456f)), u));
+  const float2 one_m_t2 = __ffma2_rn(make_float2(-t.x, -t.y), t, splat2(1.f));
+  const float2 w = __ffma2_rn(c, __fmul2_rn(c, splat2(0.1070322243f)), splat2(0.79788456f));
+  const float2 l = __fmul2_rn(__fmul2_rn(c, splat2(0.5f)), __fmul2_rn(w, one_m_t2));
+  return __ffma2_rn(__fadd2_rn(t, splat2(1.f)), splat2(0.5f), l);
+}
+#endif  // #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+template <typename ParamOP, float (*OP)(float, const ParamOP &)>
+__device__ __forceinline__ float2 op_x2(const float2 v) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if constexpr (std::is_same_v<ParamOP, Empty>) {
+    if constexpr (OP == &gelu<fp32, fp32>) {
+      return gelu_x2(v);
+    } else if constexpr (OP == &dgelu<fp32, fp32>) {
+      return dgelu_x2(v);
+    }
+  }
+#endif  // #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  return make_float2(OP(v.x, {}), OP(v.y, {}));
+}
+
 namespace quantize_2D_kernel {
 
 constexpr size_t FP8_CHUNK_DIM_Y = 128;
@@ -146,39 +202,49 @@ __global__ void __launch_bounds__(FP8_THREADS_PER_CHUNK)
     ptx::mbarrier_wait_parity(&mbar[iter], parity);
 
 #pragma unroll
-    for (int stage = 0; stage < FP8_BUFF_STAGES_NUM; ++stage) {
+    for (int stage = 0; stage < FP8_BUFF_STAGES_NUM; stage += 2) {
       const size_t stage_offset_Y = stage;
       const size_t shmem_offset_y = thread_offset_Y + stage_offset_Y;
       const size_t shmem_offset_x = thread_offset_X;
       const size_t row = row_base + shmem_offset_y;
-      const bool row_out_of_bounds = row >= rows;
-      const bool out_of_bounds = col_out_of_bounds || row_out_of_bounds;
 
-      float elt = static_cast<float>(in_sh[buff][shmem_offset_y][shmem_offset_x]);
+      float elts[2] = {static_cast<float>(in_sh[buff][shmem_offset_y][shmem_offset_x]),
+                       static_cast<float>(in_sh[buff][shmem_offset_y + 1][shmem_offset_x])};
       if constexpr (IS_DACT) {
-        float act_in_elt = static_cast<float>(act_in_sh[buff][shmem_offset_y][shmem_offset_x]);
-        elt *= OP(act_in_elt, {});
+        const float2 dact = op_x2<ParamOP, OP>(
+            make_float2(static_cast<float>(act_in_sh[buff][shmem_offset_y][shmem_offset_x]),
+                        static_cast<float>(act_in_sh[buff][shmem_offset_y + 1][shmem_offset_x])));
+        const float2 grad_dact = __fmul2_rn(make_float2(elts[0], elts[1]), dact);
+        elts[0] = grad_dact.x;
+        elts[1] = grad_dact.y;
       }
-      if constexpr (IS_DBIAS) {
-        if constexpr (IS_DACT) {
-          if (!out_of_bounds) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const float elt = elts[i];
+        const bool out_of_bounds = col_out_of_bounds || (row + i >= rows);
+        if constexpr (IS_DBIAS) {
+          if constexpr (IS_DACT) {
+            if (!out_of_bounds) {
+              partial_dbias += elt;
+            }
+          } else {
+            // If no activation, elt is 0 so we can safely do this
             partial_dbias += elt;
+          }
+        }
+        __builtin_assume(amax >= 0);
+        if (IS_DACT) {
+          if (!out_of_bounds) {
+            amax = fmaxf(amax, fabsf(elt));
           }
         } else {
           // If no activation, elt is 0 so we can safely do this
-          partial_dbias += elt;
-        }
-      }
-      __builtin_assume(amax >= 0);
-      if (IS_DACT) {
-        if (!out_of_bounds) {
           amax = fmaxf(amax, fabsf(elt));
         }
-      } else {
-        // If no activation, elt is 0 so we can safely do this
-        amax = fmaxf(amax, fabsf(elt));
       }
-      out_sh[buff][shmem_offset_y][shmem_offset_x] = static_cast<OType>(elt * scale);
+      const float2 scaled = __fmul2_rn(make_float2(elts[0], elts[1]), splat2(scale));
+      out_sh[buff][shmem_offset_y][shmem_offset_x] = static_cast<OType>(scaled.x);
+      out_sh[buff][shmem_offset_y + 1][shmem_offset_x] = static_cast<OType>(scaled.y);
     }
 
     // Wait for shared memory writes to be visible to TMA engine.
@@ -312,15 +378,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
     ptx::mbarrier_wait_parity(&mbar[iter], parity);
 
 #pragma unroll
-    for (int chunk = 0; chunk < CHUNKS_PER_ITERATION; ++chunk) {
+    for (int chunk = 0; chunk < CHUNKS_PER_ITERATION; chunk += 2) {
       const size_t shmem_offset = chunk * CHUNK_SIZE + threadIdx.x;
-      float elt = static_cast<float>(in_sh[buff][shmem_offset]);
+      float2 elt = make_float2(static_cast<float>(in_sh[buff][shmem_offset]),
+                               static_cast<float>(in_sh[buff][shmem_offset + CHUNK_SIZE]));
       if constexpr (IS_ACT) {
-        elt = OP(elt, {});
+        elt = op_x2<ParamOP, OP>(elt);
       }
       __builtin_assume(amax >= 0);
-      amax = fmaxf(amax, fabsf(elt));
-      out_sh[buff][shmem_offset] = static_cast<OType>(elt * scale);
+      amax = fmaxf(amax, fabsf(elt.x));
+      amax = fmaxf(amax, fabsf(elt.y));
+      out_sh[buff][shmem_offset] = static_cast<OType>(elt.x * scale);
+      out_sh[buff][shmem_offset + CHUNK_SIZE] = static_cast<OType>(elt.y * scale);
     }
 
     // Wait for shared memory writes to be visible to TMA engine.
