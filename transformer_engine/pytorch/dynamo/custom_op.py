@@ -38,6 +38,7 @@ on each call. The kinds -- and how each represents its field as op inputs:
     quantized storage, or ``None``: three slots (the tensor, its flat inner
     buffers, and a ``__kind__`` tag) so a quantized tensor crosses as its buffers.
   * ``SHAPE`` -- a ``torch.Size`` / ``Optional[torch.Size]``: one ``SymInt[]`` slot.
+  * ``SYMINT`` -- a ``SymIntLike`` / ``Optional[SymIntLike]`` scalar: one ``SymInt`` slot.
   * ``SIMPLE`` -- every remaining simple value (scalars, enums,
     quantizers -- value-opaque constants baked into the graph -- and nested
     collections of them), gathered into one shared ``OpaqueValueBundle`` slot.
@@ -104,6 +105,7 @@ from typing import (
 import torch
 
 from torch._prims_common import make_contiguous_strides_for
+from torch.fx.experimental.symbolic_shapes import guard_scalar
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from .tensor_spec import TensorSpec, to_tensor_spec
@@ -123,6 +125,12 @@ _TE_OP_NAMESPACE = "transformer_engine_compile"
 # tensor subclass or a *bare* ``QuantizedTensorStorage`` (the internal-quantizer
 # optimization). Matched exactly by ``_TensorOrQuantizedAdapter``.
 TensorOrQuantized = Union[torch.Tensor, QuantizedTensorStorage]
+
+# Annotation for an integer op arg that follows a tensor shape (a sequence
+# length, say): under dynamic shapes it is a ``SymInt``, which the fake impl
+# must see symbolically, so the field gets its own ``SymInt`` schema slot.
+# Every other scalar is configuration and is specialized at pack time.
+SymIntLike = Union[int, torch.SymInt]
 
 
 # ``None`` entries in an op's flat ``Tensor[]`` return are smuggled through a
@@ -399,6 +407,7 @@ class _FieldKind(Enum):
     TENSOR = "tensor"  # one ``Tensor`` / ``Tensor?`` slot
     TENSOR_OR_QUANTIZED = "tensor_or_quantized"  # 3 slots: tensor / inner / meta
     SHAPE = "shape"  # one ``SymInt[]`` / ``SymInt[]?`` slot
+    SYMINT = "symint"  # one ``SymInt`` / ``SymInt?`` slot
     PROCESS_GROUP = "process_group"  # c10d group name inside the shared bundle
     SIMPLE = "simple"  # value carried verbatim inside the shared bundle
     UNSUPPORTED = "unsupported"  # no slots; only a trivial value may cross
@@ -418,6 +427,7 @@ _SIMPLE_META_SLOT = "_simple_meta"
 # Matched by exact member set, so a bare quantized annotation or an accidental
 # extra union member is rejected rather than silently taken as tensor-or-quantized.
 _TQ_MEMBERS = frozenset(get_args(TensorOrQuantized))
+_SYMINT_MEMBERS = frozenset(get_args(SymIntLike))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,6 +457,36 @@ def _is_tensor_storage_union(annot: Any) -> bool:
         return False
     members = frozenset(a for a in get_args(annot) if a is not type(None))
     return members == _TQ_MEMBERS
+
+
+def _is_symint_annot(annot: Any) -> Tuple[bool, bool]:
+    """Whether ``annot`` is ``SymIntLike`` / ``Optional[SymIntLike]``, and whether optional."""
+    if not _is_union(annot):
+        return False, False
+    args = get_args(annot)
+    members = frozenset(a for a in args if a is not type(None))
+    return members == _SYMINT_MEMBERS, type(None) in args
+
+
+def _specialize(value: Any) -> Any:
+    """Pin a configuration scalar to a Python constant.
+
+    A no-op eagerly. Under dynamo an int / float / bool may arrive symbolic
+    (``torch.compile(dynamic=True)`` makes every scalar symbolic); ``guard_scalar``
+    guards on its value, so the graph is specialized on it and recompiles if it
+    ever changes -- which is what an opaque constant bundle needs.
+    """
+    if (
+        isinstance(value, (bool, int, float))
+        and not isinstance(value, Enum)
+        and torch.compiler.is_compiling()
+    ):
+        return guard_scalar(value)
+    if isinstance(value, tuple):
+        return tuple(_specialize(v) for v in value)
+    if isinstance(value, list):
+        return [_specialize(v) for v in value]
+    return value
 
 
 def _is_process_group_annot(annot: Any) -> bool:
@@ -499,6 +539,10 @@ def _parse_field(name: str, annot: Any) -> _FieldPlan:
     if stripped is torch.Size:
         slot = _SlotSpec(name, "SymInt[]?" if is_optional else "SymInt[]")
         return _FieldPlan(name, _FieldKind.SHAPE, (slot,))
+    is_symint, is_optional = _is_symint_annot(annot)
+    if is_symint:
+        slot = _SlotSpec(name, "SymInt?" if is_optional else "SymInt")
+        return _FieldPlan(name, _FieldKind.SYMINT, (slot,))
     # A union mixing tensor types with anything else is a malformed signature
     # (e.g. a bare quantized-storage Optional, or Tensor | int): reject it at
     # registration instead of silently degrading to an unsupported field.
@@ -639,14 +683,14 @@ class _ArgPlan:
         for field in self.fields:
             value = getattr(obj, field.name, None)
             match field.kind:
-                case _FieldKind.TENSOR | _FieldKind.SHAPE:
+                case _FieldKind.TENSOR | _FieldKind.SHAPE | _FieldKind.SYMINT:
                     slots[field.slots[0].name] = value
                 case _FieldKind.TENSOR_OR_QUANTIZED:
                     _pack_tensor_or_quantized(field, value, slots)
                 case _FieldKind.PROCESS_GROUP:
                     simple[field.name] = None if value is None else value.group_name
                 case _FieldKind.SIMPLE:
-                    simple[field.name] = value
+                    simple[field.name] = _specialize(value)
                 case _FieldKind.UNSUPPORTED:
                     # Annotation alone (e.g. Optional[Any]) can't decide; only
                     # the runtime value can, so the check runs at pack time.
@@ -673,7 +717,7 @@ class _ArgPlan:
         bundle = slots.get(_SIMPLE_META_SLOT)
         for field in self.fields:
             match field.kind:
-                case _FieldKind.TENSOR:
+                case _FieldKind.TENSOR | _FieldKind.SYMINT:
                     kwargs[field.name] = slots[field.slots[0].name]
                 case _FieldKind.SHAPE:
                     value = slots[field.slots[0].name]
