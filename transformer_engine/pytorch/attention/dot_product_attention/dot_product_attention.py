@@ -2417,8 +2417,9 @@ class DotProductAttention(TransformerEngineBaseModule):
             # harmless, because the backends disagree about it. tanh is odd, so
             # UnfusedDotProductAttention's `cap * tanh(x / cap)` applies a negative cap as its
             # absolute value and yields NaN for a non-finite one, while FlashAttention caps only
-            # when `softcap > 0` and so drops both without a word.
-            if not math.isfinite(softcap) or softcap < 0.0:
+            # when `softcap > 0` and so drops both without a word. Spelled as comparisons
+            # (NaN fails both) so a symbolic cap under torch.compile is guarded, not a graph break.
+            if not 0.0 <= softcap < math.inf:
                 raise ValueError(f"softcap must be finite and non-negative, got {softcap}.")
 
             # checks for qkv_format

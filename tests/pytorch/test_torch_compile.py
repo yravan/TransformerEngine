@@ -1107,6 +1107,25 @@ def _compare_compiled_to_eager(
     _assert_run_matches(compiled, eager, backend, dtype)
 
 
+@pytest.mark.parametrize("backend", ["flash", "fused"])
+def test_dpa_torch_compile_dynamic(monkeypatch, backend):
+    """`torch.compile(dynamic=True)` hands the module symbolic scalars: the
+    sequence lengths follow the input shape and have to reach the custom op as
+    SymInts, and every configuration scalar (the softmax scale, the window) has
+    to be specialized rather than baked into the opaque constant bundle.
+
+    Backend selection takes the sequence length as a constant, which is a graph
+    break under dynamic shapes, so this is not a full-graph test."""
+    dtype = torch.bfloat16
+    spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
+    module = _make_dpa(spec, dtype)
+    args, kwargs, grads = _make_dpa_inputs(spec, dtype)
+    _skip_unsupported(spec, backend, dtype)
+    _compare_compiled_to_eager(
+        module, args, kwargs, grads, monkeypatch, backend, dtype, dynamic=True
+    )
+
+
 @pytest.mark.parametrize("backend", ["flash", "fused", "unfused"])
 @pytest.mark.parametrize("config", _DPA_COMPILE_CONFIGS.keys())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
