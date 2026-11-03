@@ -192,6 +192,20 @@ void nvte_quantize_dbias_dgelu(const NVTETensor input, const NVTETensor act_inpu
                                NVTETensor output, NVTETensor dbias, NVTETensor workspace,
                                cudaStream_t stream);
 
+/*! \brief Computes backward of the exact (erf) GeLU operation on the input, then casts to
+ *         FP8/MXFP8, and computes dbias. Same contract as nvte_quantize_dbias_dgelu.
+ *
+ *  \param[in]     input            Input tensor to be cast.
+ *  \param[in]     act_input        Activation input tensor.
+ *  \param[in,out] output           Output FP8/MXFP8 tensor.
+ *  \param[out]    dbias            Result of the reduction of the input along columns.
+ *  \param[out]    workspace        Workspace tensor.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_quantize_dbias_dgelu_erf(const NVTETensor input, const NVTETensor act_input,
+                                   NVTETensor output, NVTETensor dbias, NVTETensor workspace,
+                                   cudaStream_t stream);
+
 /*! \brief Computes backward of GeLU operation on the grouped input, then casts to FP8/MXFP8.
  *         Additionally, reduces the result of the GeLU backward along columns.
  *         If the scaling mode of the output grouped tensor is set to NVTE_MXFP8_1D_SCALING,

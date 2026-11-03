@@ -53,6 +53,15 @@ enum class NVTE_Activation_Type {
  */
 void nvte_gelu(const NVTETensor input, NVTETensor output, cudaStream_t stream);
 
+/*! \brief Computes the exact (erf) GeLU activation of the input,
+ *         0.5 * x * (1 + erf(x / sqrt(2))) as PyTorch computes it.
+ *
+ *  \param[in]     input     Input tensor for activation.
+ *  \param[in,out] output    Output tensor.
+ *  \param[in]     stream    CUDA stream used for the operation.
+ */
+void nvte_gelu_erf(const NVTETensor input, NVTETensor output, cudaStream_t stream);
+
 /*! \brief Computes the GeLU activation of the grouped input.
  *         If the scaling mode of the grouped output tensor is set to NVTE_MXFP8_1D_SCALING,
  *         the block quantization (MXFP8) of the specified shape of the block will be used.
@@ -205,6 +214,16 @@ void nvte_group_srelu(const NVTEGroupedTensor input, NVTEGroupedTensor output, c
 void nvte_dgelu(const NVTETensor grad, const NVTETensor input, NVTETensor output,
                 cudaStream_t stream);
 
+/*! \brief Computes the exact (erf) GeLU activation gradient.
+ *
+ *  \param[in]     grad      Incoming gradient.
+ *  \param[in]     input     Input tensor for activation.
+ *  \param[in,out] output    Output tensor.
+ *  \param[in]     stream    CUDA stream used for the operation.
+ */
+void nvte_dgelu_erf(const NVTETensor grad, const NVTETensor input, NVTETensor output,
+                    cudaStream_t stream);
+
 /*! \brief Computes the GeLU activation gradient of the grouped input.
  *         If the scaling mode of the output grouped tensor is set to NVTE_MXFP8_1D_SCALING,
  *         the block quantization (MXFP8) of the specified shape of the block will be used.
@@ -354,6 +373,15 @@ void nvte_dglu(const NVTETensor grad, const NVTETensor input, NVTETensor output,
  *  \param[in]     stream    CUDA stream used for the operation.
  */
 void nvte_geglu(const NVTETensor input, NVTETensor output, cudaStream_t stream);
+
+/*! \brief Computes the gated exact (erf) GeLU activation of the input.
+ *
+ *  \param[in]     input     Input tensor of shape [N, H * 2].
+ *  \param[in,out] output    Output tensor of shape [N, H].
+ *                           It computes Act(input[N, :H]) x input[N, H:]
+ *  \param[in]     stream    CUDA stream used for the operation.
+ */
+void nvte_geglu_erf(const NVTETensor input, NVTETensor output, cudaStream_t stream);
 
 /*! \brief Computes the gated Swish activation of the input.
  *         If the scaling mode of the output tensor is set to NVTE_MXFP8_1D_SCALING,
@@ -524,6 +552,16 @@ void nvte_sreglu(const NVTETensor input, NVTETensor output, cudaStream_t stream)
  */
 void nvte_dgeglu(const NVTETensor grad, const NVTETensor input, NVTETensor output,
                  cudaStream_t stream);
+
+/*! \brief Computes the gated exact (erf) GeLU activation gradient.
+ *
+ *  \param[in]     grad      Incoming gradient of shape [N, H].
+ *  \param[in]     input     Forward input tensor of shape [N, H * 2].
+ *  \param[in,out] output    Outgoing gradient of shape [N, H * 2].
+ *  \param[in]     stream    CUDA stream used for the operation.
+ */
+void nvte_dgeglu_erf(const NVTETensor grad, const NVTETensor input, NVTETensor output,
+                     cudaStream_t stream);
 
 /*! \brief Computes the gated Swish activation gradient.
  *         If the scaling mode of the output tensor is set to NVTE_MXFP8_1D_SCALING,
