@@ -1814,6 +1814,14 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                 nvfp4_use_4over6=nvfp4_use_4over6,
                 nvfp4_e4m3_max=nvfp4_e4m3_max,
                 nvfp4_4over6_err_mode=self.recipe.nvfp4_4over6_err_mode,
+                delayed_amax=(
+                    self.recipe.delayed_amax
+                    and tensor_type != "weight"
+                    and qparams.random_hadamard_transform
+                    and not qparams.fp4_2d_quantization
+                    and not nvfp4_use_4over6
+                ),
+                amax_margin=self.recipe.amax_margin,
             )
 
         if self.mode not in ("forward", "backward"):

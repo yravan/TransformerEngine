@@ -85,6 +85,36 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   } else if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
     // Fused kernel for dbias + MXFP8 quantize
     with_fused_kernel = true;
+  } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
+    auto *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
+    if (nvfp4_quantizer_cpp->amax_warm() && nvfp4_quantizer_cpp->fused_cast_eligible(shape) &&
+        grad_output_torch.scalar_type() == at::kBFloat16) {
+      // Single pass: dbias, cast and both amaxes in one kernel, with carried global amaxes
+      std::vector<TensorWrapper> keepalive;
+      std::vector<at::Tensor> keepalive_torch;
+      QuantizationConfigWrapper config;
+      nvfp4_quantizer_cpp->prepare_fused_cast(grad_output_nvte, grad_input_nvte, config,
+                                              keepalive, keepalive_torch);
+      auto stream = at::cuda::getCurrentCUDAStream();
+      TensorWrapper workspace_nvte;
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_nvfp4_quantize_fused(grad_output_nvte.data(), nullptr, grad_input_nvte.data(),
+                                  grad_bias_nvte.data(), workspace_nvte.data(),
+                                  kNVTENVFP4FusedActNone, config, stream);
+      });
+      at::Tensor workspace_torch;
+      if (workspace_nvte.ndim() > 0 && workspace_nvte.numel() > 0) {
+        workspace_torch = allocateSpace(workspace_nvte.shape(), workspace_nvte.dtype());
+        workspace_nvte = makeTransformerEngineTensor(workspace_torch.data_ptr(),
+                                                     workspace_nvte.shape(), workspace_nvte.dtype());
+      }
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_nvfp4_quantize_fused(grad_output_nvte.data(), nullptr, grad_input_nvte.data(),
+                                  grad_bias_nvte.data(), workspace_nvte.data(),
+                                  kNVTENVFP4FusedActNone, config, stream);
+      });
+      return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
+    }
   }
 
   // Apply unfused impl if fused kernel is not supported
@@ -125,7 +155,8 @@ std::vector<py::object> dact_dbias(
     void (*dact_dbias_func)(const NVTETensor, const NVTETensor, NVTETensor, NVTETensor, NVTETensor,
                             cudaStream_t),
     void (*dact_func)(const NVTETensor, const NVTETensor, NVTETensor, cudaStream_t),
-    at::Tensor grad_output_torch, at::Tensor act_input_torch, py::handle quantizer_py) {
+    NVTENVFP4FusedAct fused_kind, at::Tensor grad_output_torch, at::Tensor act_input_torch,
+    py::handle quantizer_py) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
 
@@ -157,7 +188,8 @@ std::vector<py::object> dact_dbias(
     UNFUSED,
     FUSED_DACT_DBIAS_QUANTIZE,
     FUSED_DACT_AMAX_FP8,
-    FUSED_DACT_AMAX_NVFP4
+    FUSED_DACT_AMAX_NVFP4,
+    FUSED_NVFP4_SINGLE_PASS
   };
   Impl impl = Impl::UNFUSED;
   if (detail::IsFloat8Quantizers(quantizer_py.ptr()) ||
@@ -168,7 +200,12 @@ std::vector<py::object> dact_dbias(
   } else if (detail::IsNVFP4Quantizers(quantizer_py.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer *>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (nvfp4_quantizer_cpp->row_scaled_nvfp4 ||
+    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() &&
+        nvfp4_quantizer_cpp->fused_cast_eligible(input_shape) &&
+        grad_output_torch.scalar_type() == at::kBFloat16 &&
+        act_input_torch.scalar_type() == at::kBFloat16) {
+      impl = Impl::FUSED_NVFP4_SINGLE_PASS;
+    } else if (nvfp4_quantizer_cpp->row_scaled_nvfp4 ||
         (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax)) {
       // Amax is handled within NVFP4 quantizer
       impl = Impl::UNFUSED;
@@ -255,6 +292,34 @@ std::vector<py::object> dact_dbias(
         nvfp4_quantizer_cpp->quantize_with_amax(temp_nvte, grad_input_nvte);
         break;
       }
+    case Impl::FUSED_NVFP4_SINGLE_PASS:
+      // Single pass: dact, dbias, cast and both amaxes in one kernel, with carried global amaxes
+      {
+        auto *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
+        std::vector<TensorWrapper> keepalive;
+        std::vector<at::Tensor> keepalive_torch;
+        QuantizationConfigWrapper config;
+        nvfp4_quantizer_cpp->prepare_fused_cast(grad_output_nvte, grad_input_nvte, config,
+                                                keepalive, keepalive_torch);
+        TensorWrapper workspace_nvte;
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_nvfp4_quantize_fused(grad_output_nvte.data(), act_input_nvte.data(),
+                                    grad_input_nvte.data(), grad_bias_nvte.data(),
+                                    workspace_nvte.data(), fused_kind, config, stream);
+        });
+        at::Tensor workspace_torch;
+        if (workspace_nvte.ndim() > 0 && workspace_nvte.numel() > 0) {
+          workspace_torch = allocateSpace(workspace_nvte.shape(), workspace_nvte.dtype());
+          workspace_nvte = makeTransformerEngineTensor(
+              workspace_torch.data_ptr(), workspace_nvte.shape(), workspace_nvte.dtype());
+        }
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_nvfp4_quantize_fused(grad_output_nvte.data(), act_input_nvte.data(),
+                                    grad_input_nvte.data(), grad_bias_nvte.data(),
+                                    workspace_nvte.data(), fused_kind, config, stream);
+        });
+        break;
+      }
     default:
       NVTE_ERROR("Invalid implementation");
   }
@@ -266,33 +331,33 @@ std::vector<py::object> dact_dbias(
 
 std::vector<py::object> dbias_dgelu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer) {
-  return dact_dbias(nvte_quantize_dbias_dgelu, nvte_dgelu, grad_output, act_input, quantizer);
+  return dact_dbias(nvte_quantize_dbias_dgelu, nvte_dgelu, kNVTENVFP4FusedActDGelu, grad_output, act_input, quantizer);
 }
 
 std::vector<py::object> dbias_dgelu_erf(const at::Tensor &grad_output,
                                         const at::Tensor &act_input, py::handle quantizer) {
-  return dact_dbias(nvte_quantize_dbias_dgelu_erf, nvte_dgelu_erf, grad_output, act_input,
+  return dact_dbias(nvte_quantize_dbias_dgelu_erf, nvte_dgelu_erf, kNVTENVFP4FusedActDGeluErf, grad_output, act_input,
                     quantizer);
 }
 
 std::vector<py::object> dbias_dsilu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer) {
-  return dact_dbias(nvte_quantize_dbias_dsilu, nvte_dsilu, grad_output, act_input, quantizer);
+  return dact_dbias(nvte_quantize_dbias_dsilu, nvte_dsilu, kNVTENVFP4FusedActDSilu, grad_output, act_input, quantizer);
 }
 
 std::vector<py::object> dbias_drelu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer) {
-  return dact_dbias(nvte_quantize_dbias_drelu, nvte_drelu, grad_output, act_input, quantizer);
+  return dact_dbias(nvte_quantize_dbias_drelu, nvte_drelu, kNVTENVFP4FusedActDRelu, grad_output, act_input, quantizer);
 }
 
 std::vector<py::object> dbias_dqgelu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                      py::handle quantizer) {
-  return dact_dbias(nvte_quantize_dbias_dqgelu, nvte_dqgelu, grad_output, act_input, quantizer);
+  return dact_dbias(nvte_quantize_dbias_dqgelu, nvte_dqgelu, kNVTENVFP4FusedActDQGelu, grad_output, act_input, quantizer);
 }
 
 std::vector<py::object> dbias_dsrelu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                      py::handle quantizer) {
-  return dact_dbias(nvte_quantize_dbias_dsrelu, nvte_dsrelu, grad_output, act_input, quantizer);
+  return dact_dbias(nvte_quantize_dbias_dsrelu, nvte_dsrelu, kNVTENVFP4FusedActNone, grad_output, act_input, quantizer);
 }
 
 }  // namespace pytorch

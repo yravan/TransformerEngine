@@ -436,6 +436,13 @@ enum NVTEQuantizationConfigAttribute {
   kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath = 9,
   /*! Whether to use 2D block scaling for MXFP8 */
   kNVTEQuantizationConfigMXFP82DQuantization = 10,
+  /*! NVFP4 fused single-pass cast: NVTETensor of 2 floats receiving the fresh pre-RHT (rowwise)
+   *  and post-RHT (columnwise) amaxes by atomic max. When set, the NVFP4 cast quantizes with the
+   *  global amaxes already stored in the output tensor (carried from an earlier call) instead of
+   *  computing them in a separate pass. */
+  kNVTEQuantizationConfigNVFP4AmaxOut = 11,
+  /*! Random sign mask (16 bits) of the columnwise RHT for the NVFP4 fused single-pass cast. */
+  kNVTEQuantizationConfigNVFP4RHTSignMask = 12,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1496,6 +1503,18 @@ class QuantizationConfigWrapper {
   void set_rng_state(NVTETensor rng_state) {
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigRNGState, &rng_state,
                                            sizeof(NVTETensor));
+  }
+
+  /*! \brief Set the fresh-amax output of the NVFP4 fused single-pass cast */
+  void set_nvfp4_amax_out(NVTETensor amax_out) {
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigNVFP4AmaxOut, &amax_out,
+                                           sizeof(NVTETensor));
+  }
+
+  /*! \brief Set the RHT random sign mask of the NVFP4 fused single-pass cast */
+  void set_nvfp4_rht_sign_mask(int32_t mask) {
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigNVFP4RHTSignMask, &mask,
+                                           sizeof(int32_t));
   }
 
   /*! \brief Set whether to use 2D block scaling for NVFP4 */

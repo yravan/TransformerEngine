@@ -29,6 +29,7 @@
 #include "../mxfp8/quantize_mxfp8.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"
+#include "../nvfp4/quantize_bidim_nvfp4.cuh"
 #include "../nvfp4/quantize_transpose_nvfp4.cuh"
 
 #ifdef NVTE_WITH_CUTEDSL
@@ -111,6 +112,11 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       break;
     }
     case NVTE_NVFP4_1D_SCALING: {
+      if (nvfp4::bidim_eligible(*input_tensor, output_tensor, quant_config_cpp)) {
+        nvfp4::quantize_bidim</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
+            *input_tensor, nullptr, output_tensor, nullptr, nullptr, quant_config_cpp, stream);
+        break;
+      }
       NVTE_CHECK(!IS_ACT, "IS_ACT is not supported by FWD NVTE_NVFP4_1D_SCALING");
 
       // Check tensors
@@ -299,6 +305,12 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
       break;
     }
     case NVTE_NVFP4_1D_SCALING: {
+      if (nvfp4::bidim_eligible(*grad_tensor, output_tensor, quant_config_cpp)) {
+        nvfp4::quantize_bidim<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
+            *grad_tensor, input_tensor, output_tensor, dbias_tensor, workspace_tensor,
+            quant_config_cpp, stream);
+        break;
+      }
       NVTE_CHECK((!IS_DBIAS && !IS_DACT),
                  "IS_DBIAS and IS_DACT are not supported by BWD NVTE_NVFP4_1D_SCALING");
 

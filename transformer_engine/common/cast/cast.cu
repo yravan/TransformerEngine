@@ -13,6 +13,7 @@
 #include "../common.h"
 #include "../transpose/cast_transpose.h"
 #include "../util/multi_stream.h"
+#include "../util/math.h"
 #include "../utils.cuh"
 #include "dispatch/dequantize.cuh"
 #include "dispatch/quantize.cuh"
@@ -86,4 +87,83 @@ void nvte_multi_tensor_quantize(const NVTETensor *inputs, NVTETensor *outputs,
   for (int s = 0; s < num_stream_used; s++) {
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream, detail::get_compute_stream_event(s)));
   }
+}
+
+void nvte_nvfp4_quantize_fused(const NVTETensor input, const NVTETensor act_input,
+                               NVTETensor output, NVTETensor dbias, NVTETensor workspace,
+                               NVTENVFP4FusedAct act, const NVTEQuantizationConfig quant_config,
+                               cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_quantize_fused);
+  using namespace transformer_engine;
+  NVTE_CHECK(quant_config != nullptr, "nvte_nvfp4_quantize_fused needs a quantization config.");
+  NVTE_CHECK(reinterpret_cast<const QuantizationConfig *>(quant_config)->nvfp4_amax_out != nullptr,
+             "nvte_nvfp4_quantize_fused needs the NVFP4 amax-out tensor in the config.");
+  const bool with_dbias = dbias != nullptr;
+#define NVTE_NVFP4_FUSED_FWD(OP)                                                              \
+  dispatch::quantize_fwd_helper</*IS_ACT=*/true, Empty, OP<fp32, fp32>>(input, output,         \
+                                                                        quant_config, stream)
+#define NVTE_NVFP4_FUSED_BWD(OP)                                                              \
+  if (with_dbias) {                                                                           \
+    dispatch::quantize_bwd_helper</*IS_DBIAS=*/true, /*IS_DACT=*/true, Empty, OP<fp32, fp32>>( \
+        input, act_input, output, dbias, workspace, quant_config, stream);                    \
+  } else {                                                                                    \
+    dispatch::quantize_bwd_helper</*IS_DBIAS=*/false, /*IS_DACT=*/true, Empty, OP<fp32, fp32>>( \
+        input, act_input, output, dbias, workspace, quant_config, stream);                    \
+  }
+  switch (act) {
+    case kNVTENVFP4FusedActNone:
+      if (with_dbias) {
+        dispatch::quantize_bwd_helper</*IS_DBIAS=*/true, /*IS_DACT=*/false, Empty, nullptr>(
+            input, act_input, output, dbias, workspace, quant_config, stream);
+      } else {
+        dispatch::quantize_fwd_helper</*IS_ACT=*/false, Empty, nullptr>(input, output,
+                                                                        quant_config, stream);
+      }
+      break;
+    case kNVTENVFP4FusedActGelu:
+      NVTE_NVFP4_FUSED_FWD(gelu);
+      break;
+    case kNVTENVFP4FusedActGeluErf:
+      NVTE_NVFP4_FUSED_FWD(gelu_erf);
+      break;
+    case kNVTENVFP4FusedActSilu:
+      NVTE_NVFP4_FUSED_FWD(silu);
+      break;
+    case kNVTENVFP4FusedActQGelu:
+      NVTE_NVFP4_FUSED_FWD(qgelu);
+      break;
+    case kNVTENVFP4FusedActRelu:
+      NVTE_NVFP4_FUSED_FWD(relu);
+      break;
+    case kNVTENVFP4FusedActDGelu:
+      NVTE_NVFP4_FUSED_BWD(dgelu);
+      break;
+    case kNVTENVFP4FusedActDGeluErf:
+      NVTE_NVFP4_FUSED_BWD(dgelu_erf);
+      break;
+    case kNVTENVFP4FusedActDSilu:
+      NVTE_NVFP4_FUSED_BWD(dsilu);
+      break;
+    case kNVTENVFP4FusedActDQGelu:
+      NVTE_NVFP4_FUSED_BWD(dqgelu);
+      break;
+    case kNVTENVFP4FusedActDRelu:
+      NVTE_NVFP4_FUSED_BWD(drelu);
+      break;
+    default:
+      NVTE_ERROR("Unsupported NVFP4 fused activation (", static_cast<int>(act), ")");
+  }
+#undef NVTE_NVFP4_FUSED_FWD
+#undef NVTE_NVFP4_FUSED_BWD
+}
+
+void nvte_nvfp4_carry_amax(NVTETensor history, NVTETensor fresh, NVTETensor step, float margin,
+                           NVTETensor amax_rowwise, NVTETensor amax_columnwise,
+                           cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_carry_amax);
+  using namespace transformer_engine;
+  dispatch::nvfp4::carry_amax(*convertNVTETensorCheck(history), *convertNVTETensorCheck(fresh),
+                              *convertNVTETensorCheck(step), margin,
+                              *convertNVTETensorCheck(amax_rowwise),
+                              *convertNVTETensorCheck(amax_columnwise), stream);
 }

@@ -7,6 +7,9 @@
 #include <cuda_runtime_api.h>
 #include <pybind.h>
 
+#include <mutex>
+#include <unordered_map>
+
 #include "common.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
@@ -1918,6 +1921,102 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
 
   this->rht_matrix_random_sign_mask_t = quantizer.attr("rht_matrix_random_sign_mask_t").cast<int>();
   this->rht_matrix = quantizer.attr("rht_matrix").cast<at::Tensor>();
+
+  if (py::hasattr(quantizer, "delayed_amax") && quantizer.attr("delayed_amax").cast<bool>()) {
+    this->delayed_amax = true;
+    this->amax_margin = quantizer.attr("amax_margin").cast<float>();
+    this->amax_state_id = quantizer.attr("amax_state_id").cast<int>();
+  }
+}
+
+namespace {
+
+struct NVFP4AmaxState {
+  at::Tensor history, fresh, step;
+  bool warm = false;
+};
+
+constexpr int64_t kAmaxHistoryLen = 16;
+
+NVFP4AmaxState& nvfp4_amax_state(int id) {
+  static std::mutex mutex;
+  static std::unordered_map<int64_t, NVFP4AmaxState> registry;
+  const int64_t key = static_cast<int64_t>(id) * 64 + at::cuda::current_device();
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = registry.find(key);
+  if (it == registry.end()) {
+    const auto f32 = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const auto i32 = at::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    NVFP4AmaxState state;
+    state.history = torch::zeros({2, kAmaxHistoryLen}, f32);
+    state.fresh = torch::zeros({2}, f32);
+    state.step = torch::zeros({1}, i32);
+    it = registry.emplace(key, std::move(state)).first;
+  }
+  return it->second;
+}
+
+}  // namespace
+
+bool NVFP4Quantizer::amax_warm() const {
+  return this->delayed_amax && nvfp4_amax_state(this->amax_state_id).warm;
+}
+
+bool NVFP4Quantizer::fused_cast_eligible(const std::vector<size_t>& shape) const {
+  if (!this->delayed_amax || !this->with_rht || !this->with_post_rht_amax ||
+      this->with_2d_quantization || this->row_scaled_nvfp4 || this->disable_second_level_scale ||
+      this->with_amax_reduction || this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled ||
+      !this->rowwise_usage || !this->columnwise_usage || this->scale_dtype != DType::kFloat8E4M3) {
+    return false;
+  }
+  if (shape.size() < 2) return false;
+  size_t rows = 1;
+  for (size_t i = 0; i + 1 < shape.size(); ++i) rows *= shape[i];
+  const size_t cols = shape.back();
+  return rows % 64 == 0 && cols % 64 == 0 && cols > 0;
+}
+
+void NVFP4Quantizer::prepare_fused_cast(const TensorWrapper& input, TensorWrapper& out,
+                                        QuantizationConfigWrapper& config,
+                                        std::vector<TensorWrapper>& keepalive,
+                                        std::vector<at::Tensor>& keepalive_torch) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVTE_CHECK(out.get_amax().data_ptr != nullptr && out.get_columnwise_amax().data_ptr != nullptr,
+             "NVFP4 fused cast needs the output's amax buffers.");
+  NVFP4AmaxState& state = nvfp4_amax_state(this->amax_state_id);
+  if (!state.warm) {
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_hadamard_transform_amax(input.data(), out.data(), 0,
+                                   this->rht_matrix_random_sign_mask_t, stream);
+    });
+    state.warm = true;
+  } else {
+    auto history = makeTransformerEngineTensor(state.history);
+    auto fresh = makeTransformerEngineTensor(state.fresh);
+    auto step = makeTransformerEngineTensor(state.step);
+    auto amax_row = makeTransformerEngineTensor(out.get_amax().data_ptr, std::vector<size_t>{1},
+                                                DType::kFloat32);
+    auto amax_col = makeTransformerEngineTensor(out.get_columnwise_amax().data_ptr,
+                                                std::vector<size_t>{1}, DType::kFloat32);
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_nvfp4_carry_amax(history.data(), fresh.data(), step.data(), this->amax_margin,
+                            amax_row.data(), amax_col.data(), stream);
+    });
+  }
+  keepalive.push_back(makeTransformerEngineTensor(state.fresh));
+  config.set_nvfp4_amax_out(keepalive.back().data());
+  config.set_nvfp4_rht_sign_mask(this->rht_matrix_random_sign_mask_t);
+  config.set_stochastic_rounding(this->stochastic_rounding);
+  if (this->stochastic_rounding) {
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+    auto opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    at::PhiloxCudaState philox_args = init_philox_state(gen, 1024);
+    keepalive_torch.push_back(torch::empty({2}, opts));
+    philox_unpack(philox_args, static_cast<int64_t*>(keepalive_torch.back().data_ptr()));
+    keepalive.push_back(makeTransformerEngineTensor(keepalive_torch.back()));
+    config.set_rng_state(keepalive.back().data());
+  }
 }
 
 void NVFP4Quantizer::set_quantization_params(TensorWrapper* tensor) const {
@@ -2699,6 +2798,19 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
       quant_config_columnwise.set_rng_state(te_rng_state_columnwise.data());
       quant_config_columnwise.set_nvfp4_2d_quantization(this->with_2d_quantization);
     }
+  }
+
+  // Single-pass fused cast with carried global amax.
+  if (compute_amax && this->fused_cast_eligible(convertShape(input.shape())) &&
+      input.dtype() == DType::kBFloat16) {
+    std::vector<TensorWrapper> keepalive;
+    std::vector<at::Tensor> keepalive_torch;
+    QuantizationConfigWrapper fused_config;
+    if (noop_flag) fused_config.set_noop_tensor(noop_flag->data());
+    this->prepare_fused_cast(input, out, fused_config, keepalive, keepalive_torch);
+    NVTE_SCOPED_GIL_RELEASE(
+        { nvte_quantize_v2(input.data(), out.data(), fused_config, stream); });
+    return;
   }
 
   // Compute amax.

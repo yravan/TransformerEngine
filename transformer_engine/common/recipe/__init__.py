@@ -575,6 +575,12 @@ class NVFP4BlockScaling(Recipe):
              If set to `True`, stochastic rounding is disabled during quantization for all tensors.
     disable_2d_quantization : bool, default = False
              If set to `True`, 1D block scaling with block size 16 is used for all tensors.
+    delayed_amax : bool, default = False
+             If set to `True`, activation and gradient casts with RHT take their global
+             amaxes from the quantizer's previous casts (times `amax_margin`) and run as one
+             pass over the data; the first cast of each quantizer is exact.
+    amax_margin : float, default = 1.25
+             Safety factor on the carried amax; values above it saturate.
     row_scaled_activation : bool, default = False
              If set to `True`, forward activation quantizers emit row-scaled
              NVFP4 tensors. In this mode, rowwise ``amax`` metadata is stored
@@ -606,6 +612,8 @@ class NVFP4BlockScaling(Recipe):
     )
     disable_2d_quantization: bool = os.getenv("NVTE_NVFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
     row_scaled_activation: bool = os.getenv("NVTE_NVFP4_ROW_SCALED_ACTIVATION", "0") == "1"
+    delayed_amax: bool = os.getenv("NVTE_NVFP4_DELAYED_AMAX", "0") == "1"
+    amax_margin: float = float(os.getenv("NVTE_NVFP4_AMAX_MARGIN", "1.25"))
     nvfp4_4over6: str = os.getenv("NVTE_NVFP4_4OVER6", "none")
     nvfp4_4over6_e4m3_use_256: str = os.getenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all")
     nvfp4_4over6_err_mode: str = os.getenv("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").upper()

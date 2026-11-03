@@ -14,7 +14,8 @@ namespace {
 using FuncType = void(const NVTETensor, NVTETensor, cudaStream_t);
 using DFuncType = void(const NVTETensor, const NVTETensor, NVTETensor, cudaStream_t);
 
-template <FuncType* act_func, auto act_func_with_args, typename... Args>
+template <FuncType* act_func, auto act_func_with_args,
+          NVTENVFP4FusedAct fused_kind = kNVTENVFP4FusedActNone, typename... Args>
 py::object activation_helper(const at::Tensor& input, py::handle quantizer, int shape_divisor = 1,
                              Args&&... args) {
   init_extension();
@@ -32,7 +33,13 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   auto [out_nvte, out_py] = quantizer_cpp->create_tensor(output_shape, fake_dtype);
 
   // Choose implementation
-  enum class Impl { UNFUSED, FULLY_FUSED, FUSED_ACTIVATION_AMAX_FP8, FUSED_ACTIVATION_AMAX_NVFP4 };
+  enum class Impl {
+    UNFUSED,
+    FULLY_FUSED,
+    FUSED_ACTIVATION_AMAX_FP8,
+    FUSED_ACTIVATION_AMAX_NVFP4,
+    FUSED_NVFP4_SINGLE_PASS
+  };
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || detail::IsFloat8Quantizers(quantizer.ptr()) ||
       detail::IsMXFP8Quantizers(quantizer.ptr())) {
@@ -42,7 +49,13 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (nvfp4_quantizer_cpp->row_scaled_nvfp4 ||
+    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() &&
+        nvfp4_quantizer_cpp->fused_cast_eligible(output_shape) &&
+        input_tensor.scalar_type() == at::kBFloat16) {
+      // Single pass: activation, cast and both amaxes in one kernel, with carried global amaxes.
+      // A cold quantizer takes the unfused path, whose quantize computes the exact amaxes.
+      impl = Impl::FUSED_NVFP4_SINGLE_PASS;
+    } else if (nvfp4_quantizer_cpp->row_scaled_nvfp4 ||
         (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax)) {
       // Amax is handled within NVFP4 quantizer
       impl = Impl::UNFUSED;
@@ -121,6 +134,18 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
         nvfp4_quantizer_cpp->quantize_with_amax(temp_nvte, out_nvte);
       }
       break;
+    case Impl::FUSED_NVFP4_SINGLE_PASS: {
+      auto* nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer*>(quantizer_cpp.get());
+      std::vector<TensorWrapper> keepalive;
+      std::vector<at::Tensor> keepalive_torch;
+      QuantizationConfigWrapper config;
+      nvfp4_quantizer_cpp->prepare_fused_cast(input_nvte, out_nvte, config, keepalive,
+                                              keepalive_torch);
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_nvfp4_quantize_fused(input_nvte.data(), nullptr, out_nvte.data(), nullptr, nullptr,
+                                  fused_kind, config, stream);
+      });
+    } break;
     default:
       NVTE_ERROR("Invalid activation implementation (", static_cast<int>(impl), ")");
   }
@@ -128,7 +153,8 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   return out_py;
 }
 
-template <DFuncType* dact_func, auto dact_func_with_args, typename... Args>
+template <DFuncType* dact_func, auto dact_func_with_args,
+          NVTENVFP4FusedAct fused_kind = kNVTENVFP4FusedActNone, typename... Args>
 py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& input,
                               py::handle quantizer, Args&&... args) {
   init_extension();
@@ -148,7 +174,13 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
   auto [grad_input_nvte, grad_input_py] = quantizer_cpp->create_tensor(input_shape, fake_dtype);
 
   // Choose implementation
-  enum class Impl { UNFUSED, FULLY_FUSED, FUSED_ACTIVATION_AMAX_FP8, FUSED_ACTIVATION_AMAX_NVFP4 };
+  enum class Impl {
+    UNFUSED,
+    FULLY_FUSED,
+    FUSED_ACTIVATION_AMAX_FP8,
+    FUSED_ACTIVATION_AMAX_NVFP4,
+    FUSED_NVFP4_SINGLE_PASS
+  };
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || detail::IsFloat8Quantizers(quantizer.ptr()) ||
       detail::IsMXFP8Quantizers(quantizer.ptr())) {
@@ -158,7 +190,13 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (nvfp4_quantizer_cpp->row_scaled_nvfp4 ||
+    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() &&
+        nvfp4_quantizer_cpp->fused_cast_eligible(input_shape) &&
+        input_tensor.scalar_type() == at::kBFloat16) {
+      // Single pass: activation, cast and both amaxes in one kernel, with carried global amaxes.
+      // A cold quantizer takes the unfused path, whose quantize computes the exact amaxes.
+      impl = Impl::FUSED_NVFP4_SINGLE_PASS;
+    } else if (nvfp4_quantizer_cpp->row_scaled_nvfp4 ||
         (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax)) {
       // Amax is handled within NVFP4 quantizer
       impl = Impl::UNFUSED;
@@ -237,6 +275,21 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
         nvfp4_quantizer_cpp->quantize_with_amax(temp_nvte, grad_input_nvte);
       }
       break;
+    case Impl::FUSED_NVFP4_SINGLE_PASS: {
+      auto* nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer*>(quantizer_cpp.get());
+      NVTE_CHECK(grad_output_tensor.scalar_type() == at::kBFloat16,
+                 "NVFP4 single-pass dact needs a BF16 gradient.");
+      std::vector<TensorWrapper> keepalive;
+      std::vector<at::Tensor> keepalive_torch;
+      QuantizationConfigWrapper config;
+      nvfp4_quantizer_cpp->prepare_fused_cast(grad_output_nvte, grad_input_nvte, config,
+                                              keepalive, keepalive_torch);
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_nvfp4_quantize_fused(grad_output_nvte.data(), input_nvte.data(),
+                                  grad_input_nvte.data(), nullptr, nullptr, fused_kind, config,
+                                  stream);
+      });
+    } break;
     default:
       NVTE_ERROR("Invalid activation implementation (", static_cast<int>(impl), ")");
   }
@@ -247,11 +300,11 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
 
 /* GELU and variants */
 py::object gelu(const at::Tensor& input, py::handle quantizer) {
-  return activation_helper<nvte_gelu, nullptr>(input, quantizer);
+  return activation_helper<nvte_gelu, nullptr, kNVTENVFP4FusedActGelu>(input, quantizer);
 }
 
 py::object dgelu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
-  return dactivation_helper<nvte_dgelu, nullptr>(grad, input, quantizer);
+  return dactivation_helper<nvte_dgelu, nullptr, kNVTENVFP4FusedActDGelu>(grad, input, quantizer);
 }
 
 py::object glu(const at::Tensor& input, py::handle quantizer) {
@@ -271,11 +324,11 @@ py::object dgeglu(const at::Tensor& grad, const at::Tensor& input, py::handle qu
 }
 
 py::object gelu_erf(const at::Tensor& input, py::handle quantizer) {
-  return activation_helper<nvte_gelu_erf, nullptr>(input, quantizer);
+  return activation_helper<nvte_gelu_erf, nullptr, kNVTENVFP4FusedActGeluErf>(input, quantizer);
 }
 
 py::object dgelu_erf(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
-  return dactivation_helper<nvte_dgelu_erf, nullptr>(grad, input, quantizer);
+  return dactivation_helper<nvte_dgelu_erf, nullptr, kNVTENVFP4FusedActDGeluErf>(grad, input, quantizer);
 }
 
 py::object geglu_erf(const at::Tensor& input, py::handle quantizer) {
@@ -287,11 +340,11 @@ py::object dgeglu_erf(const at::Tensor& grad, const at::Tensor& input, py::handl
 }
 
 py::object qgelu(const at::Tensor& input, py::handle quantizer) {
-  return activation_helper<nvte_qgelu, nullptr>(input, quantizer);
+  return activation_helper<nvte_qgelu, nullptr, kNVTENVFP4FusedActQGelu>(input, quantizer);
 }
 
 py::object dqgelu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
-  return dactivation_helper<nvte_dqgelu, nullptr>(grad, input, quantizer);
+  return dactivation_helper<nvte_dqgelu, nullptr, kNVTENVFP4FusedActDQGelu>(grad, input, quantizer);
 }
 
 py::object qgeglu(const at::Tensor& input, py::handle quantizer) {
@@ -304,11 +357,11 @@ py::object dqgeglu(const at::Tensor& grad, const at::Tensor& input, py::handle q
 
 /* ReLU and variants */
 py::object relu(const at::Tensor& input, py::handle quantizer) {
-  return activation_helper<nvte_relu, nullptr>(input, quantizer);
+  return activation_helper<nvte_relu, nullptr, kNVTENVFP4FusedActRelu>(input, quantizer);
 }
 
 py::object drelu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
-  return dactivation_helper<nvte_drelu, nullptr>(grad, input, quantizer);
+  return dactivation_helper<nvte_drelu, nullptr, kNVTENVFP4FusedActDRelu>(grad, input, quantizer);
 }
 
 py::object reglu(const at::Tensor& input, py::handle quantizer) {
@@ -336,11 +389,11 @@ py::object dsreglu(const at::Tensor& grad, const at::Tensor& input, py::handle q
 }
 /* Silu and variants */
 py::object silu(const at::Tensor& input, py::handle quantizer) {
-  return activation_helper<nvte_silu, nullptr>(input, quantizer);
+  return activation_helper<nvte_silu, nullptr, kNVTENVFP4FusedActSilu>(input, quantizer);
 }
 
 py::object dsilu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
-  return dactivation_helper<nvte_dsilu, nullptr>(grad, input, quantizer);
+  return dactivation_helper<nvte_dsilu, nullptr, kNVTENVFP4FusedActDSilu>(grad, input, quantizer);
 }
 
 py::object swiglu(const at::Tensor& input, py::handle quantizer) {

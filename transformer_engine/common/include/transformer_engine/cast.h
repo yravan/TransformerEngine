@@ -514,6 +514,56 @@ void nvte_group_nvfp4_compute_amax(const NVTETensor input, NVTETensor *outputs,
                                    const size_t *split_sections, size_t num_tensors,
                                    cudaStream_t stream);
 
+/*! \enum NVTENVFP4FusedAct
+ *  \brief Activation fused into the single-pass NVFP4 cast (nvte_nvfp4_quantize_fused).
+ */
+enum NVTENVFP4FusedAct {
+  kNVTENVFP4FusedActNone = 0,
+  kNVTENVFP4FusedActGelu = 1,
+  kNVTENVFP4FusedActGeluErf = 2,
+  kNVTENVFP4FusedActDGelu = 3,
+  kNVTENVFP4FusedActDGeluErf = 4,
+  kNVTENVFP4FusedActSilu = 5,
+  kNVTENVFP4FusedActDSilu = 6,
+  kNVTENVFP4FusedActQGelu = 7,
+  kNVTENVFP4FusedActDQGelu = 8,
+  kNVTENVFP4FusedActRelu = 9,
+  kNVTENVFP4FusedActDRelu = 10
+};
+
+/*! \brief Single-pass NVFP4 cast (rowwise + RHT'd columnwise) of a BF16 tensor, optionally fused
+ *         with an activation (forward) or an activation gradient and the bias gradient (backward).
+ *
+ *  The output's amax fields must already hold the global amaxes to encode with (pre-RHT for the
+ *  rowwise copy, post-RHT for the columnwise one); the fresh amaxes of what was quantized are
+ *  accumulated by atomic max into the 2-float tensor set with kNVTEQuantizationConfigNVFP4AmaxOut,
+ *  which must be set (together with kNVTEQuantizationConfigNVFP4RHTSignMask). dbias and workspace
+ *  follow the nvte_quantize_dbias protocol and are ignored for forward activations.
+ *
+ *  \param[in]      input         BF16 input (the gradient for backward activations).
+ *  \param[in]      act_input     Activation input for backward activations, NULL otherwise.
+ *  \param[in,out]  output        NVFP4 output with rowwise and columnwise data.
+ *  \param[out]     dbias         Bias gradient (backward only; NULL for none).
+ *  \param[out]     workspace     Workspace for the bias gradient.
+ *  \param[in]      act           Fused activation.
+ *  \param[in]      quant_config  Quantization configuration.
+ *  \param[in]      stream        CUDA stream used for the operation.
+ */
+void nvte_nvfp4_quantize_fused(const NVTETensor input, const NVTETensor act_input,
+                               NVTETensor output, NVTETensor dbias, NVTETensor workspace,
+                               NVTENVFP4FusedAct act, const NVTEQuantizationConfig quant_config,
+                               cudaStream_t stream);
+
+/*! \brief Carry the global amaxes of an NVFP4 quantizer from its previous casts to the next one.
+ *
+ *  Folds `fresh` (2 floats: rowwise, columnwise) into slot `step % history_len` of `history`
+ *  ([2, history_len] floats), increments `step` (1 int32), writes `margin` times the maximum
+ *  over the history into `amax_rowwise` / `amax_columnwise` (1 float each) and zeroes `fresh`.
+ */
+void nvte_nvfp4_carry_amax(NVTETensor history, NVTETensor fresh, NVTETensor step, float margin,
+                           NVTETensor amax_rowwise, NVTETensor amax_columnwise,
+                           cudaStream_t stream);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

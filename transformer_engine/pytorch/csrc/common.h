@@ -366,7 +366,28 @@ class NVFP4Quantizer : public Quantizer {
   int rht_matrix_random_sign_mask_t;
   at::Tensor rht_matrix;
 
+  // Carried global amax (single-pass fused cast): the global amaxes are taken from this quantizer's
+  // own previous casts instead of a separate pass over the data. The state lives in a registry keyed
+  // by amax_state_id, so a quantizer rebuilt from its value (torch.compile) finds the same state.
+  bool delayed_amax = false;
+  float amax_margin = 1.0f;
+  int amax_state_id = 0;
+
   explicit NVFP4Quantizer(const py::handle& quantizer);
+
+  /*! @brief Whether this quantizer's carried amax has been seeded by an exact first cast */
+  bool amax_warm() const;
+
+  /*! @brief Whether the single-pass fused cast with carried amax serves a tensor of this shape */
+  bool fused_cast_eligible(const std::vector<size_t>& shape) const;
+
+  /*! @brief Fill the output's global amaxes (exact on the first call, carried afterwards) and the
+   *  config fields the fused cast reads (amax out, RHT sign mask, stochastic rounding + RNG state).
+   *  `keepalive` must outlive the cast: it owns the wrappers the config points at. */
+  void prepare_fused_cast(const TensorWrapper& input, TensorWrapper& out,
+                          QuantizationConfigWrapper& config,
+                          std::vector<TensorWrapper>& keepalive,
+                          std::vector<at::Tensor>& keepalive_torch);
 
   NVTEScalingMode get_scaling_mode() const override { return NVTE_NVFP4_1D_SCALING; }
 

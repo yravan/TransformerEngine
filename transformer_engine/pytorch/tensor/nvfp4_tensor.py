@@ -5,6 +5,7 @@
 """Tensor class with NVFP4 data"""
 from __future__ import annotations
 from collections.abc import Iterable
+import itertools
 import math
 import warnings
 from typing import Any, Dict, Optional, Tuple, Union
@@ -112,6 +113,9 @@ def get_random_sign_mask_for_rht(with_random_sign_mask: bool, device: int) -> in
     return 0
 
 
+_AMAX_STATE_IDS = itertools.count(1)
+
+
 class NVFP4Quantizer(Quantizer):
     """Builder class for NVFP4 tensors with NV block scaling"""
 
@@ -144,6 +148,11 @@ class NVFP4Quantizer(Quantizer):
     """RHT sign mask (0 when sign randomization is disabled)"""
     rht_matrix_random_sign_mask_t: int
 
+    """Single-pass fused cast: take the global amaxes from this quantizer's previous casts"""
+    delayed_amax: bool
+    amax_margin: float
+    amax_state_id: int
+
     def __init__(
         self,
         fp4_dtype: Union[DType, tex.DType] = DType.kFloat4E2M1,
@@ -162,8 +171,16 @@ class NVFP4Quantizer(Quantizer):
         nvfp4_4over6_err_mode: str = "MAE",
         with_random_sign_mask: bool = True,
         disable_second_level_scale: bool = False,
+        delayed_amax: bool = False,
+        amax_margin: float = 1.25,
+        amax_state_id: Optional[int] = None,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
+        self.delayed_amax = delayed_amax
+        self.amax_margin = float(amax_margin)
+        # Identifies this quantizer's carried-amax state (a registry in the C++ extension), so a
+        # copy or a quantizer rebuilt from its value (torch.compile) keeps carrying the same amaxes.
+        self.amax_state_id = next(_AMAX_STATE_IDS) if amax_state_id is None else int(amax_state_id)
         self.dtype = DType.cast(fp4_dtype)
         self.scale_dtype = DType.cast(scale_dtype)
         if self.scale_dtype not in (DType.kFloat8E4M3, DType.kFloat8UE5M3):
@@ -267,6 +284,9 @@ class NVFP4Quantizer(Quantizer):
             nvfp4_4over6_err_mode=self.nvfp4_4over6_err_mode,
             with_random_sign_mask=self.rht_matrix_random_sign_mask_t != 0,
             disable_second_level_scale=self.disable_second_level_scale,
+            delayed_amax=self.delayed_amax,
+            amax_margin=self.amax_margin,
+            amax_state_id=self.amax_state_id,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm
