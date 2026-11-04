@@ -2519,6 +2519,70 @@ def test_te_ops_compile_delayed_scaling_first_call_runs_eagerly():
             torch.testing.assert_close(p_c.grad, p_r.grad, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
+@pytest.mark.parametrize("cache_quantized_input", [False, True])
+@pytest.mark.parametrize(
+    "fp8_recipe",
+    [
+        pytest.param(None, id="bf16"),
+        pytest.param(
+            recipe.Float8CurrentScaling(),
+            id="current",
+            marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8),
+        ),
+        pytest.param(
+            recipe.MXFP8BlockScaling(),
+            id="mxfp8",
+            marks=pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8),
+        ),
+    ],
+)
+def test_te_ops_swiglu_compiles_fullgraph(fp8_recipe, cache_quantized_input):
+    """te.ops.SwiGLU has forward and backward custom ops, so Linear -> SwiGLU -> Linear
+    compiles as one graph under every value-opaque recipe, with the saved input kept or
+    quantized, and matches eager. The eager warm-up builds the recipe state the compiled
+    call reads."""
+    dtype, device = torch.bfloat16, "cuda"
+    torch.manual_seed(0)
+
+    def make():
+        return te.ops.Sequential(
+            te.ops.Linear(64, 64, dtype=dtype, device=device),
+            te.ops.SwiGLU(cache_quantized_input=cache_quantized_input),
+            te.ops.Linear(32, 64, dtype=dtype, device=device),
+        )
+
+    def autocast():
+        if fp8_recipe is None:
+            return contextlib.nullcontext()
+        return te.autocast(recipe=fp8_recipe)
+
+    def step(fn, inp):
+        x = inp.clone().requires_grad_(True)
+        with autocast():
+            out = fn(x)
+        out.sum().backward()
+        return out, x.grad
+
+    model, ref = make(), make()
+    ref.load_state_dict(model.state_dict())
+    inp = torch.randn(32, 64, dtype=dtype, device=device)
+    step(model, inp)
+    step(ref, inp)
+    for param in (*model.parameters(), *ref.parameters()):
+        param.grad = None
+    torch._dynamo.reset()
+    compiled = torch.compile(model, fullgraph=True)
+    for _ in range(2):
+        inp = torch.randn(32, 64, dtype=dtype, device=device)
+        out_c, dx_c = step(compiled, inp)
+        out_r, dx_r = step(ref, inp)
+        torch.testing.assert_close(out_c, out_r, atol=0, rtol=0)
+        torch.testing.assert_close(dx_c, dx_r, atol=0, rtol=0)
+        for p_c, p_r in zip(model.parameters(), ref.parameters()):
+            torch.testing.assert_close(p_c.grad, p_r.grad, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
 @pytest.mark.parametrize("module", _LINEAR_MODULES)
 def test_te_modules_delayed_scaling_run_eagerly(module):
