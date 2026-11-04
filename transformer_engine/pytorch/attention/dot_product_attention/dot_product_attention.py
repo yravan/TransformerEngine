@@ -13,7 +13,6 @@ import logging
 from packaging.version import Version as PkgVersion
 import torch
 import torch.nn.functional as F
-from torch.fx.experimental.symbolic_shapes import guard_scalar
 from torch.nn.parameter import Parameter
 
 from transformer_engine.pytorch.device import te_device_type

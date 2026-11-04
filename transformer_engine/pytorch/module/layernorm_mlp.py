@@ -164,14 +164,9 @@ def _get_act_func_supported_list(
             "clamped_swiglu": (tex.clamped_swiglu, tex.clamped_dswiglu, None),
         }
     # no activation fusion written yet
-    # Per-tensor current scaling or fp8 blockwise scaling or custom quantization: []
+    # fp8 blockwise scaling, nvfp4 or custom quantization: []
     # TODO(ksivaman): Fuse nvfp4 act once kernel is available.
-    if (
-        recipe.float8_current_scaling()
-        or recipe.float8_block_scaling()
-        or recipe.nvfp4()
-        or recipe.custom()
-    ):
+    if recipe.float8_block_scaling() or recipe.nvfp4() or recipe.custom():
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),

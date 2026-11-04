@@ -435,7 +435,6 @@ class BasicLinear(BasicOperation):
         get_cublas_workspace(weight.device.index, False, False)
 
     def pre_fuser_forward(self, ctx: OperationContext) -> None:
-        super().pre_fuser_forward(ctx)
         input_quantizer = self.get_quantizer("forward", 0)
         weight_quantizer = self.get_quantizer("forward", 1)
         grad_output_quantizer = self.get_quantizer("backward", 0)
