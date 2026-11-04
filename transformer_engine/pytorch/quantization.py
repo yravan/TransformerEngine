@@ -277,18 +277,22 @@ def check_recipe_support(recipe: Recipe) -> None:
         raise RuntimeError(unsupported_reason)
 
 
-def recipe_compile_fallback_reason() -> Optional[str]:
-    """Why the active quantization recipe has no torch.compile path, or ``None``.
+def recipe_compile_fallback_reason(recipe: Optional[Recipe] = None) -> Optional[str]:
+    """Why ``recipe`` -- the active quantization recipe when none is given -- has no
+    torch.compile path, or ``None``.
 
     Decided from the recipe alone, so a compiled frame can branch on it without guarding
-    on any module's state. Delayed scaling keeps per-module scales and amax histories in
+    on any module's state, and a caller planning a compile can ask about a recipe it has
+    not entered yet. Delayed scaling keeps per-module scales and amax histories in
     tensors that its quantizers read and update in place (they are not value-opaque), so
     nothing built on it can run through a custom op; a compiled call runs it eagerly as a
     whole (see ``forward_eagerly``).
     """
-    if not FP8GlobalStateManager.is_fp8_enabled():
-        return None
-    if FP8GlobalStateManager.get_fp8_recipe().delayed():
+    if recipe is None:
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            return None
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+    if recipe.delayed():
         return "delayed scaling has no torch.compile path"
     return None
 
