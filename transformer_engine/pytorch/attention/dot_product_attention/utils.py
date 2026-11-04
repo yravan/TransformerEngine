@@ -383,8 +383,9 @@ class AttentionParams:
         """Backend selection is a constant of a compiled graph (``assume_constant_result``),
         so under torch.compile every shape-derived field is specialized on construction: a
         symbolic batch size, sequence length, head count or head size becomes a guard on its
-        value rather than a graph break. ONNX export keeps symbolic shapes."""
-        if is_in_onnx_export_mode():
+        value rather than a graph break. Outside a trace every field is concrete already;
+        ONNX export keeps symbolic shapes."""
+        if not torch.compiler.is_compiling() or is_in_onnx_export_mode():
             return
         for field in fields(self):
             value = getattr(self, field.name)
