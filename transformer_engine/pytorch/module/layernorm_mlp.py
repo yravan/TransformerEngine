@@ -38,7 +38,7 @@ from .base import (
 from ..quantization import (
     FP8GlobalStateManager,
     QuantizerRole,
-    recipe_compile_fallback_reason,
+    compiled_call_runs_eagerly,
 )
 from ..jit import (
     bias_gelu_fused,
@@ -3106,11 +3106,8 @@ class LayerNormMLP(TransformerEngineBaseModule):
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
         """
-        if torch.compiler.is_compiling():
-            fallback_reason = recipe_compile_fallback_reason()
-            if fallback_reason is not None:
-                warn_compile_eager_fallback(fallback_reason)
-                return forward_eagerly(self, inp, is_first_microbatch)
+        if compiled_call_runs_eagerly():
+            return forward_eagerly(self, inp, is_first_microbatch)
 
         is_grad_enabled = torch.is_grad_enabled()
 

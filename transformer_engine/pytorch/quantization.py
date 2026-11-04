@@ -30,7 +30,7 @@ from transformer_engine.common.recipe import (
 )
 from .constants import dist_group_type, DType
 
-from .utils import get_device_compute_capability
+from .utils import get_device_compute_capability, warn_compile_eager_fallback
 from .jit import jit_fuser
 
 
@@ -295,6 +295,25 @@ def recipe_compile_fallback_reason(recipe: Optional[Recipe] = None) -> Optional[
     if recipe.delayed():
         return "delayed scaling has no torch.compile path"
     return None
+
+
+def compiled_call_runs_eagerly() -> bool:
+    """Whether the forward dynamo is tracing must run outside it as a whole.
+
+    True when the active recipe has no torch.compile path
+    (``recipe_compile_fallback_reason``). Such a recipe has no traceable eager
+    path either -- quantizers that read data pointers, recipe state built on the
+    first call -- so a graph break would not do: dynamo would keep tracing the
+    resumed frame, including the module's autograd function. Warns once per
+    compilation.
+    """
+    if not torch.compiler.is_compiling():
+        return False
+    reason = recipe_compile_fallback_reason()
+    if reason is None:
+        return False
+    warn_compile_eager_fallback(reason)
+    return True
 
 
 def get_default_fp8_recipe() -> Recipe:

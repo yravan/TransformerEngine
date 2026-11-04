@@ -16,7 +16,7 @@ from ..quantization import (
     FP8GlobalStateManager,
     Recipe,
     _has_delayed_scaling_state,
-    recipe_compile_fallback_reason,
+    compiled_call_runs_eagerly,
 )
 from ..quantized_tensor import prepare_for_saving, restore_from_func_ctx
 from ..utils import warn_compile_eager_fallback
@@ -784,15 +784,8 @@ class OperationFuser:
         *extra_inputs: torch.Tensor,
         basic_op_kwargs: Optional[list[dict[str, Any]]] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        # A recipe with no torch.compile path (delayed scaling) has no traceable eager path
-        # either (quantizers that read data pointers, recipe state built on the first call),
-        # so the whole call runs outside dynamo. A graph break would not do: dynamo keeps
-        # tracing the resumed frame, including the fuser's autograd function.
-        if torch.compiler.is_compiling():
-            fallback_reason = recipe_compile_fallback_reason()
-            if fallback_reason is not None:
-                warn_compile_eager_fallback(fallback_reason)
-                return _call_eagerly(self, input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
+        if compiled_call_runs_eagerly():
+            return _call_eagerly(self, input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
         return self._call_impl(input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
 
     def _call_impl(
@@ -829,10 +822,9 @@ class OperationFuser:
         # Attempt to fuse operations if neccesary
         self.maybe_fuse_ops(is_grad_enabled, recipe, input, basic_op_extra_inputs)
 
-        # Initialization before forward
-        for idx, op in enumerate(self._basic_ops):
-            if torch.compiler.is_compiling() and op._fp8_metas is not None:
-                if any(
+        if torch.compiler.is_compiling():
+            for op in self._basic_ops:
+                if op._fp8_metas is not None and any(
                     meta is not None and _has_delayed_scaling_state(meta)
                     for meta in op._fp8_metas.values()
                 ):
