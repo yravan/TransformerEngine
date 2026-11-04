@@ -1056,15 +1056,9 @@ void Float8CurrentScalingQuantizer::quantize_with_dbias(TensorWrapper& input, Te
   input.set_amax(nullptr, DType::kFloat32, input.defaultShape);
   const CastFn cast = [&dbias](const NVTETensor in, NVTETensor fp8_out,
                                const NVTEQuantizationConfig, cudaStream_t stream) {
-    TensorWrapper workspace;
-    nvte_quantize_dbias(in, fp8_out, dbias.data(), workspace.data(), stream);
-    at::Tensor workspace_torch;
-    if (workspace.ndim() > 0 && workspace.numel() > 0) {
-      workspace_torch = allocateSpace(workspace.shape(), workspace.dtype());
-      workspace = makeTransformerEngineTensor(workspace_torch.data_ptr(), workspace.shape(),
-                                              workspace.dtype());
-    }
-    nvte_quantize_dbias(in, fp8_out, dbias.data(), workspace.data(), stream);
+    launch_with_workspace([&](NVTETensor workspace) {
+      nvte_quantize_dbias(in, fp8_out, dbias.data(), workspace, stream);
+    });
   };
   this->quantize_impl(input, out, std::nullopt, compute_amax, std::move(amax_buf),
                       at::empty({1}, opts), cast);

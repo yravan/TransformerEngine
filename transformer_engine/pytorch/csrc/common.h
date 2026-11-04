@@ -606,6 +606,24 @@ at::Tensor allocateSpace(const std::vector<size_t>& shape, const transformer_eng
 at::Tensor allocateSpace(const NVTEShape& shape, const transformer_engine::DType type,
                          bool init_to_zeros = false);
 
+/*! @brief Run a kernel that takes a workspace: query the size, allocate, launch
+ *
+ * `launch` is called with an empty workspace tensor, which the kernel fills in
+ * with the shape and dtype it needs, and then with the allocated one.
+ */
+template <typename Launch>
+void launch_with_workspace(Launch&& launch) {
+  transformer_engine::TensorWrapper workspace;
+  launch(workspace.data());
+  at::Tensor workspace_torch;
+  if (workspace.ndim() > 0 && workspace.numel() > 0) {
+    workspace_torch = allocateSpace(workspace.shape(), workspace.dtype());
+    workspace = makeTransformerEngineTensor(workspace_torch.data_ptr(), workspace.shape(),
+                                            workspace.dtype());
+  }
+  launch(workspace.data());
+}
+
 at::Tensor allocateTorchTensor(int M, int N, transformer_engine::DType dtype);
 
 at::Tensor allocateTorchTensor(int M, transformer_engine::DType dtype);

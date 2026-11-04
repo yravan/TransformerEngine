@@ -945,3 +945,49 @@ class TestFP8CurrentScalingRecipeLayerNormLinear(TestFP8RecipeLayerNormLinearBas
             recipe1_golden_tensors=None,
             recipe2_golden_tensors=fp8_zero_tolerance_tensor_dumps_recipe2,
         )
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+class TestFP8CurrentScalingFusedDbias:
+    """The bias gradient fused into the current-scaling cast (``bgrad_quantize`` and the
+    dbias + dact kernels) matches the unfused reduction and cast: the quantized data bit
+    for bit (same amax, same scale, same per-element cast) and the bias gradient up to
+    reduction order. The fused cast kernel takes a rowwise-only quantizer on SM 10.0+
+    only, so before that the rowwise-only case exercises the unfused fallback."""
+
+    @staticmethod
+    def _quantizer(columnwise):
+        return te.Float8CurrentScalingQuantizer(
+            fp8_dtype=te.DType.kFloat8E5M2,
+            device=torch.device("cuda"),
+            rowwise=True,
+            columnwise=columnwise,
+        )
+
+    @staticmethod
+    def _assert_same_quantized(actual, expected):
+        torch.testing.assert_close(actual._data, expected._data, atol=0, rtol=0)
+        torch.testing.assert_close(actual._scale_inv, expected._scale_inv, atol=0, rtol=0)
+        if expected._transpose is None:
+            assert actual._transpose is None
+        else:
+            torch.testing.assert_close(actual._transpose, expected._transpose, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("columnwise", [False, True], ids=["rowwise", "rowwise_columnwise"])
+    def test_bgrad_quantize(self, columnwise):
+        torch.manual_seed(0)
+        grad_output = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda")
+        dbias, quantized = tex.bgrad_quantize(grad_output, self._quantizer(columnwise))
+        torch.testing.assert_close(dbias, grad_output.sum(dim=0))
+        self._assert_same_quantized(quantized, self._quantizer(columnwise)(grad_output))
+
+    @pytest.mark.parametrize("columnwise", [False, True], ids=["rowwise", "rowwise_columnwise"])
+    def test_dbias_dgelu(self, columnwise):
+        torch.manual_seed(0)
+        grad_output = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda")
+        act_input = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda")
+        dbias, quantized = tex.dbias_dgelu(grad_output, act_input, self._quantizer(columnwise))
+        torch.testing.assert_close(dbias, tex.dgelu(grad_output, act_input, None).sum(dim=0))
+        self._assert_same_quantized(
+            quantized, tex.dgelu(grad_output, act_input, self._quantizer(columnwise))
+        )

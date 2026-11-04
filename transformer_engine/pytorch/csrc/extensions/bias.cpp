@@ -103,26 +103,12 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
     return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
   }
 
-  // Query workspace size
-  TensorWrapper workspace_nvte;
-  at::Tensor workspace_torch;
   auto stream = at::cuda::getCurrentCUDAStream();
   NVTE_SCOPED_GIL_RELEASE({
-    nvte_quantize_dbias(grad_output_nvte.data(), grad_input_nvte.data(), grad_bias_nvte.data(),
-                        workspace_nvte.data(), stream);
-  });
-
-  // Allocate workspace
-  if (workspace_nvte.ndim() > 0 && workspace_nvte.numel() > 0) {
-    workspace_torch = allocateSpace(workspace_nvte.shape(), workspace_nvte.dtype());
-    workspace_nvte = makeTransformerEngineTensor(workspace_torch.data_ptr(), workspace_nvte.shape(),
-                                                 workspace_nvte.dtype());
-  }
-
-  // Launch fused kernel
-  NVTE_SCOPED_GIL_RELEASE({
-    nvte_quantize_dbias(grad_output_nvte.data(), grad_input_nvte.data(), grad_bias_nvte.data(),
-                        workspace_nvte.data(), stream);
+    launch_with_workspace([&](NVTETensor workspace) {
+      nvte_quantize_dbias(grad_output_nvte.data(), grad_input_nvte.data(), grad_bias_nvte.data(),
+                          workspace, stream);
+    });
   });
 
   return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
@@ -208,25 +194,11 @@ std::vector<py::object> dact_dbias(
     case Impl::FUSED_DACT_DBIAS_QUANTIZE:
       // Fused dact-dbias-quantize kernel
       {
-        // Query workspace size
-        TensorWrapper workspace_nvte;
         NVTE_SCOPED_GIL_RELEASE({
-          dact_dbias_func(grad_output_nvte.data(), act_input_nvte.data(), grad_input_nvte.data(),
-                          grad_bias_nvte.data(), workspace_nvte.data(), stream);
-        });
-
-        // Allocate workspace
-        at::Tensor workspace_torch;
-        if (workspace_nvte.ndim() > 0 && workspace_nvte.numel() > 0) {
-          workspace_torch = allocateSpace(workspace_nvte.shape(), workspace_nvte.dtype());
-          workspace_nvte = makeTransformerEngineTensor(
-              workspace_torch.data_ptr(), workspace_nvte.shape(), workspace_nvte.dtype());
-        }
-
-        // Launch kernel
-        NVTE_SCOPED_GIL_RELEASE({
-          dact_dbias_func(grad_output_nvte.data(), act_input_nvte.data(), grad_input_nvte.data(),
-                          grad_bias_nvte.data(), workspace_nvte.data(), stream);
+          launch_with_workspace([&](NVTETensor workspace) {
+            dact_dbias_func(grad_output_nvte.data(), act_input_nvte.data(), grad_input_nvte.data(),
+                            grad_bias_nvte.data(), workspace, stream);
+          });
         });
         break;
       }
