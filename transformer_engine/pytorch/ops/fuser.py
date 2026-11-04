@@ -12,7 +12,12 @@ from typing import Any, Optional, TypeAlias
 
 import torch
 
-from ..quantization import FP8GlobalStateManager, Recipe, _has_delayed_scaling_state
+from ..quantization import (
+    FP8GlobalStateManager,
+    Recipe,
+    _has_delayed_scaling_state,
+    recipe_compile_fallback_reason,
+)
 from ..quantized_tensor import prepare_for_saving, restore_from_func_ctx
 from ..utils import warn_compile_eager_fallback
 from .op import (
@@ -782,16 +787,15 @@ class OperationFuser:
         *extra_inputs: torch.Tensor,
         basic_op_kwargs: Optional[list[dict[str, Any]]] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        # Delayed scaling has no torch.compile path and its eager path is not traceable
-        # (quantizers that read data pointers, recipe state built on the first call), so the
-        # whole call runs outside dynamo. A graph break would not do: dynamo keeps tracing
-        # the resumed frame, including the fuser's autograd function.
-        if (
-            torch.compiler.is_compiling()
-            and FP8GlobalStateManager.is_fp8_enabled()
-            and FP8GlobalStateManager.get_fp8_recipe().delayed()
-        ):
-            return _call_eagerly(self, input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
+        # A recipe with no torch.compile path (delayed scaling) has no traceable eager path
+        # either (quantizers that read data pointers, recipe state built on the first call),
+        # so the whole call runs outside dynamo. A graph break would not do: dynamo keeps
+        # tracing the resumed frame, including the fuser's autograd function.
+        if torch.compiler.is_compiling():
+            fallback_reason = recipe_compile_fallback_reason()
+            if fallback_reason is not None:
+                warn_compile_eager_fallback(fallback_reason)
+                return _call_eagerly(self, input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
         return self._call_impl(input, *extra_inputs, basic_op_kwargs=basic_op_kwargs)
 
     def _call_impl(

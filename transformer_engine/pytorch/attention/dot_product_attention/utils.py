@@ -18,6 +18,7 @@ import numpy as np
 from packaging.version import Version as PkgVersion
 
 import torch
+from torch.fx.experimental.symbolic_shapes import guard_scalar
 import torch.distributed as dist
 import torch.nn.functional as F
 import transformer_engine_torch as tex
@@ -202,6 +203,19 @@ pip install flash-attn-4==4.0.0b33 nvidia-cutlass-dsl[cu13]==4.8.0"""
         FlashAttentionUtils.v4_is_installed = True
 
 
+def _concrete_scalars(value: Any) -> Any:
+    """``value`` with every scalar in it (an int / float / bool, or a tuple or list of
+    them such as a shape) specialized: a symbolic one becomes its current value plus a
+    guard, a concrete one is returned as is. Tested by Python type because dynamo reports
+    a symbolic scalar's type as its concrete type (``isinstance(s, torch.SymInt)`` traces
+    to ``False``)."""
+    if isinstance(value, (bool, int, float, torch.SymBool, torch.SymInt, torch.SymFloat)):
+        return guard_scalar(value)
+    if isinstance(value, (tuple, list)):
+        return type(value)(_concrete_scalars(v) for v in value)
+    return value
+
+
 @dataclass(eq=True)
 class AttentionParams:
     """
@@ -364,6 +378,19 @@ class AttentionParams:
             elif (sf or {}).get("recipe", None) != (of or {}).get("recipe", None):
                 return False
         return True
+
+    def __post_init__(self) -> None:
+        """Backend selection is a constant of a compiled graph (``assume_constant_result``),
+        so under torch.compile every shape-derived field is specialized on construction: a
+        symbolic batch size, sequence length, head count or head size becomes a guard on its
+        value rather than a graph break. ONNX export keeps symbolic shapes."""
+        if is_in_onnx_export_mode():
+            return
+        for field in fields(self):
+            value = getattr(self, field.name)
+            concrete = _concrete_scalars(value)
+            if concrete is not value:
+                setattr(self, field.name, concrete)
 
 
 @dataclass(eq=True)

@@ -18,6 +18,7 @@ from transformer_engine.pytorch.torch_version import torch_version
 
 from transformer_engine.pytorch.device import te_device_type
 from .base import (
+    forward_eagerly,
     fill_userbuffers_buffer_for_all_gather,
     get_cublasmp_all_gather_output,
     get_dummy_wgrad,
@@ -42,7 +43,11 @@ from ._common import (
     set_quantizer_usage_for_wgrad_all_gather,
     WeightGradStore,
 )
-from ..quantization import FP8GlobalStateManager, QuantizerRole
+from ..quantization import (
+    FP8GlobalStateManager,
+    QuantizerRole,
+    recipe_compile_fallback_reason,
+)
 from ..utils import (
     cast_if_needed,
     clear_tensor_data,
@@ -2292,6 +2297,12 @@ class Linear(TransformerEngineBaseModule):
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
         """
+        if torch.compiler.is_compiling():
+            fallback_reason = recipe_compile_fallback_reason()
+            if fallback_reason is not None:
+                warn_compile_eager_fallback(fallback_reason)
+                return forward_eagerly(self, inp, is_first_microbatch, fp8_output, fp8_grad)
+
         is_grad_enabled = torch.is_grad_enabled()
 
         if is_in_onnx_export_mode():

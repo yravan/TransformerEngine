@@ -277,6 +277,22 @@ def check_recipe_support(recipe: Recipe) -> None:
         raise RuntimeError(unsupported_reason)
 
 
+def recipe_compile_fallback_reason() -> Optional[str]:
+    """Why the active quantization recipe has no torch.compile path, or ``None``.
+
+    Decided from the recipe alone, so a compiled frame can branch on it without guarding
+    on any module's state. Delayed scaling keeps per-module scales and amax histories in
+    tensors that its quantizers read and update in place (they are not value-opaque), so
+    nothing built on it can run through a custom op; a compiled call runs it eagerly as a
+    whole (see ``forward_eagerly``).
+    """
+    if not FP8GlobalStateManager.is_fp8_enabled():
+        return None
+    if FP8GlobalStateManager.get_fp8_recipe().delayed():
+        return "delayed scaling has no torch.compile path"
+    return None
+
+
 def get_default_fp8_recipe() -> Recipe:
     """FP8 recipe with default args."""
     assert not torch.compiler.is_compiling(), (

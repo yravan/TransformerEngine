@@ -95,6 +95,18 @@ _MIN_STREAM_PRIORITY, _MAX_STREAM_PRIORITY = None, None
 layers_atomic_ring_exchange = []
 
 
+@torch.compiler.disable
+def forward_eagerly(module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
+    """Run ``module.forward`` outside dynamo, as one graph break at the call.
+
+    For a call that has no compiled path (``recipe_compile_fallback_reason``). The eager
+    forward is not traceable past its first extension call, and tracing up to it would
+    guard the frame on the module's lazily built state, which recompiles the frame for
+    every other instance that shares it.
+    """
+    return module.forward(*args, **kwargs)
+
+
 def _get_high_precision_init_val(parameter: torch.Tensor) -> Optional[torch.Tensor]:
     """Return temporary pre-quantization initialization stored on a parameter."""
     return getattr(parameter, "_high_precision_init_val", None)

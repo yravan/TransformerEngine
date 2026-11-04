@@ -1114,16 +1114,46 @@ def test_dpa_torch_compile_dynamic(monkeypatch, backend):
     SymInts, and every configuration scalar (the softmax scale, the window) has
     to be specialized rather than baked into the opaque constant bundle.
 
-    Backend selection takes the sequence length as a constant, which is a graph
-    break under dynamic shapes, so this is not a full-graph test."""
+    Backend selection takes the batch size and the sequence lengths as constants
+    (``assume_constant_result``), so the module specializes them before selecting;
+    ``fullgraph=True`` makes the test fail if that specialization ever regresses
+    into a graph break."""
     dtype = torch.bfloat16
     spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
     module = _make_dpa(spec, dtype)
     args, kwargs, grads = _make_dpa_inputs(spec, dtype)
     _skip_unsupported(spec, backend, dtype)
     _compare_compiled_to_eager(
-        module, args, kwargs, grads, monkeypatch, backend, dtype, dynamic=True
+        module, args, kwargs, grads, monkeypatch, backend, dtype, dynamic=True, fullgraph=True
     )
+
+
+@pytest.mark.parametrize("backend", ["flash", "fused"])
+def test_dpa_compile_alternating_batch_sizes(monkeypatch, backend):
+    """Callers with two batch sizes alternate through one compiled DotProductAttention:
+    one graph per batch size, then cache hits. Eager calls memoize backend selection in
+    a process-global cache; a compiled call must not read it, or its graph guards on
+    whichever call ran last and recompiles on every switch. One eager call first, as
+    every compile here: it settles the module's lazily set state (activation dtype), which
+    a cold compiled call would otherwise bake into its first graph and recompile once."""
+    dtype = torch.bfloat16
+    spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
+    _skip_unsupported(spec, backend, dtype)
+    _force_dpa_backend(monkeypatch, backend)
+    module = _make_dpa(spec, dtype)
+    config = spec["model_config"]
+
+    def qkv(batch_size):
+        shape = (batch_size, config.max_seqlen_q, config.num_heads, config.head_dim_qk)
+        return [torch.randn(shape, dtype=dtype, device="cuda") for _ in range(3)]
+
+    module(*qkv(2))
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("eager")
+    compiled = torch.compile(module, backend=counter, fullgraph=True)
+    for batch_size in (2, 4, 2, 4, 2, 4):
+        compiled(*qkv(batch_size))
+    assert counter.frame_count == 2
 
 
 @pytest.mark.parametrize("backend", ["flash", "fused", "unfused"])
@@ -2487,6 +2517,50 @@ def test_te_ops_compile_delayed_scaling_first_call_runs_eagerly():
         torch.testing.assert_close(x_c.grad, x_r.grad, atol=0, rtol=0)
         for p_c, p_r in zip(model.parameters(), ref.parameters()):
             torch.testing.assert_close(p_c.grad, p_r.grad, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("module", _LINEAR_MODULES)
+def test_te_modules_delayed_scaling_run_eagerly(module):
+    """Delayed scaling has no compiled path (its quantizers are not value-opaque), so a
+    compiled call runs the module's forward outside dynamo as a whole, from the first
+    call. Numerics match eager; nothing past the recipe check is traced (no cache entry
+    for ``prepare_forward``), and the check itself is one compiled prefix shared by every
+    instance of the class: tracing into the module would guard on its lazily built recipe
+    state and recompile once per instance."""
+    dtype, device = torch.bfloat16, "cuda"
+    fp8_recipe = recipe.DelayedScaling()
+
+    def make():
+        torch.manual_seed(0)
+        return [_make_module(module, dtype=dtype, device=device) for _ in range(3)]
+
+    def fn(models, x):
+        return models[0](x) + models[1](x) + models[2](x)
+
+    models_ref, models = make(), make()
+    torch._dynamo.reset()
+    compiled = torch.compile(fn)
+    for step in range(3):
+        inp = torch.randn(32, 64, dtype=dtype, device=device)
+        x_ref, x = inp.clone().requires_grad_(True), inp.clone().requires_grad_(True)
+        with te.autocast(recipe=fp8_recipe):
+            out_ref = fn(models_ref, x_ref)
+            if step == 0:
+                with pytest.warns(UserWarning, match="delayed scaling has no torch.compile path"):
+                    out = compiled(models, x)
+            else:
+                out = compiled(models, x)
+        out_ref.sum().backward()
+        out.sum().backward()
+        torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
+        torch.testing.assert_close(x.grad, x_ref.grad, atol=0, rtol=0)
+        for m, m_ref in zip(models, models_ref):
+            for p, p_ref in zip(m.parameters(), m_ref.parameters()):
+                torch.testing.assert_close(p.grad, p_ref.grad, atol=0, rtol=0)
+    cache_entries = torch._C._dynamo.eval_frame._debug_get_cache_entry_list
+    assert not cache_entries(TransformerEngineBaseModule.prepare_forward.__code__)
+    assert len(cache_entries(type(models[0]).forward.__code__)) == 1
 
 
 @pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
