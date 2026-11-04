@@ -3448,11 +3448,11 @@ class LayerNormMLP(TransformerEngineBaseModule):
         ) = [None] * 10
         fc1_weight_quantizer, fc2_weight_quantizer = self._get_weight_quantizers()
         if self.fp8 or self.fp8_calibration:
-            fc1_input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+            fc1_input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_INPUT)
             fc1_input_quantizer.internal = True
             if not self.sequence_parallel:
                 fc1_input_quantizer.optimize_for_gemm = True
-            fc2_input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_INPUT]
+            fc2_input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_INPUT)
             fc2_input_quantizer.set_usage(
                 rowwise=True,
                 columnwise=isinstance(
@@ -3463,17 +3463,17 @@ class LayerNormMLP(TransformerEngineBaseModule):
             fc2_input_quantizer.internal = True
             fc2_input_quantizer.optimize_for_gemm = True
             if fp8_output:
-                fc2_output_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_OUTPUT]
+                fc2_output_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_OUTPUT)
             if is_grad_enabled:
-                fc2_grad_output_quantizer = self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT2
-                ]
+                fc2_grad_output_quantizer = self._call_quantizer(
+                    "scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT2
+                )
                 fc2_grad_output_quantizer.internal = True
                 if not self.sequence_parallel:
                     fc2_grad_output_quantizer.optimize_for_gemm = True
-                fc1_grad_output_quantizer = self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT1
-                ]
+                fc1_grad_output_quantizer = self._call_quantizer(
+                    "scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT1
+                )
                 fc1_grad_output_quantizer.internal = True
                 fc1_grad_output_quantizer.optimize_for_gemm = True
 
@@ -3686,9 +3686,9 @@ class LayerNormMLP(TransformerEngineBaseModule):
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
             return [None, None]
-        fc1_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+        fc1_weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_WEIGHT)
         fc1_weight_quantizer.internal = True
-        fc2_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_WEIGHT]
+        fc2_weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_WEIGHT)
         fc2_weight_quantizer.internal = True
         return [fc1_weight_quantizer, fc2_weight_quantizer]
 

@@ -37,7 +37,7 @@ from ...utils import (
     clear_tensor_data,
     devices_match,
 )
-from ..op import BasicOperation
+from ..op import BasicOperation, OperationContext
 from .._common import (
     get_accumulate_flag_in_param,
     get_dummy_wgrads_for_params,
@@ -434,20 +434,25 @@ class BasicLinear(BasicOperation):
             return
         get_cublas_workspace(weight.device.index, False, False)
 
-    def pre_fuser_forward(self, *, requires_grad: bool) -> None:
-        super().pre_fuser_forward(requires_grad=requires_grad)
+    def pre_fuser_forward(self, ctx: OperationContext) -> None:
+        super().pre_fuser_forward(ctx)
+        input_quantizer = self.get_quantizer("forward", 0)
+        weight_quantizer = self.get_quantizer("forward", 1)
+        grad_output_quantizer = self.get_quantizer("backward", 0)
         if FP8GlobalStateManager.is_fp8_enabled():
-            # Configure quantizer usages
-            weight_requires_grad = requires_grad and self.weight.requires_grad
+            weight_requires_grad = ctx.requires_grad and self.weight.requires_grad
             columnwise_usage = weight_requires_grad
             if FP8GlobalStateManager.get_fp8_recipe().backward_override is not None:
                 columnwise_usage = False
-            input_quantizer = self.get_quantizer("forward", 0)
-            weight_quantizer = self.get_quantizer("forward", 1)
-            grad_output_quantizer = self.get_quantizer("backward", 0)
+            input_quantizer = input_quantizer.copy()
+            weight_quantizer = weight_quantizer.copy()
+            grad_output_quantizer = grad_output_quantizer.copy()
             input_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
-            weight_quantizer.set_usage(rowwise=True, columnwise=requires_grad)
+            weight_quantizer.set_usage(rowwise=True, columnwise=ctx.requires_grad)
             grad_output_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
+        ctx.input_quantizer = input_quantizer
+        ctx.weight_quantizer = weight_quantizer
+        ctx.grad_output_quantizer = grad_output_quantizer
 
     def reset_recipe_state(self, *, recipe: Optional[Recipe]) -> None:
         super().reset_recipe_state(recipe=recipe)
@@ -1114,10 +1119,10 @@ class BasicLinear(BasicOperation):
             weight_requires_grad=basic_op_ctxs[0].requires_grad and self.weight.requires_grad,
             with_quantized_compute=with_quantized_compute,
             backward_override=backward_override,
-            input_quantizer=self.get_quantizer("forward", 0),
-            weight_quantizer=self.get_quantizer("forward", 1),
+            input_quantizer=basic_op_ctxs[0].input_quantizer,
+            weight_quantizer=basic_op_ctxs[0].weight_quantizer,
             output_quantizer=next_op_input_quantizer,
-            grad_output_quantizer=self.get_quantizer("backward", 0),
+            grad_output_quantizer=basic_op_ctxs[0].grad_output_quantizer,
             grad_input_quantizer=prev_op_grad_output_quantizer,
             tensor_parallel_mode=self.tensor_parallel_mode,
             tensor_parallel_group=self.tensor_parallel_group,

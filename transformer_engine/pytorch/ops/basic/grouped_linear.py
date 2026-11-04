@@ -812,8 +812,8 @@ class GroupedLinear(BasicOperation):
                             f"Expected no biases, but bias {group_idx} is initialized"
                         )
 
-    def pre_fuser_forward(self, *, requires_grad: bool) -> None:
-        super().pre_fuser_forward(requires_grad=requires_grad)
+    def pre_fuser_forward(self, ctx: OperationContext) -> None:
+        super().pre_fuser_forward(ctx)
         if FP8GlobalStateManager.is_fp8_enabled():
             # Assume weights have consistent grad requirement
             weight_requires_grad = (
@@ -821,15 +821,17 @@ class GroupedLinear(BasicOperation):
                 if self.single_grouped_weight
                 else self.weight0.requires_grad
             )
-            weight_requires_grad = requires_grad and weight_requires_grad
+            weight_requires_grad = ctx.requires_grad and weight_requires_grad
 
             # Configure the first group's input and grad output
             # quantizers since they are exposed externally and may be
             # used by other ops for early quantization
-            input_quantizer = self.get_quantizer("forward", 0)
-            grad_output_quantizer = self.get_quantizer("backward", 0)
+            input_quantizer = self.get_quantizer("forward", 0).copy()
+            grad_output_quantizer = self.get_quantizer("backward", 0).copy()
             input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
             grad_output_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
+            ctx.input_quantizer = input_quantizer
+            ctx.grad_output_quantizer = grad_output_quantizer
 
     def reset_recipe_state(self, *, recipe: Optional[Recipe]) -> None:
         super().reset_recipe_state(recipe=recipe)
@@ -1139,7 +1141,7 @@ class GroupedLinear(BasicOperation):
                 split_sizes=split_sizes,
                 scales=scales,
                 with_quantized_compute=with_quantized_compute,
-                input_quantizer=self.get_quantizer("forward", 0),
+                input_quantizer=ctx.input_quantizer,
                 weight_quantizers=weight_quantizers,
                 dtype=dtype,
                 input_requires_grad=input_requires_grad,
@@ -1148,8 +1150,8 @@ class GroupedLinear(BasicOperation):
                 out_buffer=out_buffer,
             )
         else:
-            input_quantizers = [
-                self.get_quantizer("forward", 2 * group_idx) for group_idx in range(num_groups)
+            input_quantizers = [ctx.input_quantizer] + [
+                self.get_quantizer("forward", 2 * group_idx) for group_idx in range(1, num_groups)
             ]
             weight_quantizers = [
                 self.get_quantizer("forward", 2 * group_idx + 1) for group_idx in range(num_groups)
@@ -1233,11 +1235,10 @@ class GroupedLinear(BasicOperation):
         num_groups = self.num_groups
         weight_param = self.weight if self.single_grouped_weight else self.weight0
 
-        if use_grouped_tensor_path:
-            grad_output_quantizers = [self.get_quantizer("backward", 0)]
-        else:
-            grad_output_quantizers = [
-                self.get_quantizer("backward", group_idx) for group_idx in range(num_groups)
+        grad_output_quantizers = [basic_op_ctxs[0].grad_output_quantizer]
+        if not use_grouped_tensor_path:
+            grad_output_quantizers += [
+                self.get_quantizer("backward", group_idx) for group_idx in range(1, num_groups)
             ]
 
         with_quantized_compute = FP8GlobalStateManager.is_fp8_enabled()
