@@ -78,8 +78,11 @@ Two-tier op (``base`` + ``wrapper``), so a ``QuantizedTensor`` subclass can be a
 op *input*. The ``<op>_base`` op carries the real schema + autograd; a custom op
 can't take a tensor-subclass input directly, so the ``<op>`` wrapper intercepts
 those via ``register_torch_dispatch`` and flattens each into the base op's slots
-(``_flatten_subclass_into_slots``) before forwarding. An empty subclass list makes
-the wrapper a pass-through (plain / bf16 calls go straight through).
+(``_flatten_subclass_into_slots``) before forwarding. That forwarding is the
+*traced* path (a ``FakeTensorMode`` is active: dynamo / AOT tracing and the fake
+kernels torch runs under it); a real call runs the kernel directly on the
+wrapper's arguments (``_make_slot_forwarder``), so per call there is one
+dispatcher round trip and no flatten / rebuild of quantized tensors.
 """
 
 from __future__ import annotations
@@ -143,10 +146,11 @@ SymIntLike = Union[int, torch.SymInt]
 _NONE_SENTINEL_DTYPE = torch.complex32
 
 
-def _encode_none(t: Optional[torch.Tensor]) -> torch.Tensor:
-    """Replace ``None`` with a 0-element sentinel tensor."""
+def _encode_none(t: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
+    """Replace ``None`` with a 0-element sentinel tensor on ``device`` (the op's
+    device, so CUDA Graph partitioning sees every output on one device)."""
     if t is None:
-        return torch.empty(0, dtype=_NONE_SENTINEL_DTYPE)
+        return torch.empty(0, dtype=_NONE_SENTINEL_DTYPE, device=device)
     return t
 
 
@@ -598,16 +602,19 @@ def _pack_tensor_or_quantized(field: _FieldPlan, value: Any, slots: Dict[str, An
         )
 
 
-def _unpack_tensor_or_quantized(field: _FieldPlan, slots: Dict[str, Any]) -> Any:
-    """Inverse of :func:`_pack_tensor_or_quantized`."""
-    tensor_slot, inner_slot, meta_slot = (s.name for s in field.slots)
-    meta = slots[meta_slot]
+def _unpack_tensor_or_quantized(
+    field: _FieldPlan, flat: Sequence[Any], slot_index: Dict[str, int]
+) -> Any:
+    """Inverse of :func:`_pack_tensor_or_quantized`, reading the field's three
+    slots out of the op's flat argument sequence."""
+    tensor_slot, inner_slot, meta_slot = (slot_index[s.name] for s in field.slots)
+    meta = flat[meta_slot]
     kind = meta[_TQ_KIND_KEY]
     if kind == _TensorOrQuantizedKind.NONE:
         return None
     if kind == _TensorOrQuantizedKind.TENSOR:
-        return slots[tensor_slot]
-    return _storage_unflatten(meta, slots[inner_slot])
+        return flat[tensor_slot]
+    return _storage_unflatten(meta, flat[inner_slot])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -627,6 +634,7 @@ class _ArgPlan:
     arg_type: type
     fields: Tuple[_FieldPlan, ...]
     slot_names: Tuple[str, ...]
+    slot_index: Dict[str, int]
     schema_str: str
 
     def tensor_field_names(self) -> Tuple[str, ...]:
@@ -708,22 +716,23 @@ class _ArgPlan:
             slots[_SIMPLE_META_SLOT] = OpaqueValueBundle(simple)
         return slots
 
-    def unpack(self, slots: Dict[str, Any]) -> Any:
-        """Rebuild a fresh ``arg_type`` instance from the op's flat slot dict.
-
-        Inverse of :meth:`pack`.
+    def unpack(self, flat: Sequence[Any]) -> Any:
+        """Rebuild a fresh ``arg_type`` instance from the op's flat arguments
+        (in ``slot_names`` order). Inverse of :meth:`pack`; this is the per-call
+        path, so it reads by slot position and builds nothing else.
         """
         kwargs: Dict[str, Any] = {}
-        bundle = slots.get(_SIMPLE_META_SLOT)
+        index = self.slot_index
+        bundle = flat[index[_SIMPLE_META_SLOT]] if _SIMPLE_META_SLOT in index else None
         for field in self.fields:
             match field.kind:
                 case _FieldKind.TENSOR | _FieldKind.SYMINT:
-                    kwargs[field.name] = slots[field.slots[0].name]
+                    kwargs[field.name] = flat[index[field.slots[0].name]]
                 case _FieldKind.SHAPE:
-                    value = slots[field.slots[0].name]
+                    value = flat[index[field.slots[0].name]]
                     kwargs[field.name] = None if value is None else torch.Size(value)
                 case _FieldKind.TENSOR_OR_QUANTIZED:
-                    kwargs[field.name] = _unpack_tensor_or_quantized(field, slots)
+                    kwargs[field.name] = _unpack_tensor_or_quantized(field, flat, index)
                 case _FieldKind.PROCESS_GROUP:
                     if bundle is not None:
                         name = bundle[field.name]
@@ -781,6 +790,7 @@ def _parse_arg_type(cls: type) -> _ArgPlan:
         arg_type=cls,
         fields=fields,
         slot_names=slot_names,
+        slot_index={name: i for i, name in enumerate(slot_names)},
         schema_str=schema_str,
     )
 
@@ -820,21 +830,22 @@ def _spec_slot_count(spec: Optional[TensorSpec]) -> int:
 
 def _flatten_value(
     value: Optional[Union[torch.Tensor, QuantizedTensorStorage, TensorSpec]],
+    device: torch.device,
 ) -> List[torch.Tensor]:
     """Return the flat ``Tensor[]`` slots that represent one op output ``value``.
 
     Pack-side inverse of :meth:`_OutputPlan.user_outputs`; the slot count
-    matches :func:`_spec_slot_count`.
+    matches :func:`_spec_slot_count`. ``device`` is where ``None`` sentinels go.
     """
     if value is None:
-        return [_encode_none(None)]
+        return [_encode_none(None, device)]
     if isinstance(value, TensorSpec):
-        return [_encode_none(t) for t in value.create_inner_tensors()]
+        return [_encode_none(t, device) for t in value.create_inner_tensors()]
     if hasattr(value, "__tensor_flatten__"):
         inner_names, _ = value.__tensor_flatten__()
-        return [_encode_none(getattr(value, n)) for n in inner_names]
+        return [_encode_none(getattr(value, n), device) for n in inner_names]
     if isinstance(value, torch.Tensor):
-        return [_encode_none(value)]
+        return [_encode_none(value, device)]
     raise TypeError(
         f"unsupported value type {type(value).__name__}; expected None / "
         "torch.Tensor / tensor subclass / bare storage / TensorSpec."
@@ -870,7 +881,7 @@ def _check_fwd_result(result: Any) -> None:
         raise TypeError("fwd impl 'ctx_attrs' slot must be a dict or None")
 
 
-def _pack_fwd_result(result: Any) -> List[torch.Tensor]:
+def _pack_fwd_result(result: Any, device: torch.device) -> List[torch.Tensor]:
     """Pack a fwd-impl return tuple into the op's ``Tensor[]`` payload.
 
     User outputs first, then saved-for-backward tensors in declaration order.
@@ -878,16 +889,16 @@ def _pack_fwd_result(result: Any) -> List[torch.Tensor]:
     num_outputs = len(result) - _FWD_TRAILING_SLOTS
     flat: List[torch.Tensor] = []
     for value in result[:num_outputs]:
-        flat.extend(_flatten_value(value))
+        flat.extend(_flatten_value(value, device))
     saved = result[num_outputs]
     if saved is not None:
         for value in saved:
-            flat.extend(_flatten_value(value))
+            flat.extend(_flatten_value(value, device))
     return flat
 
 
 def _pack_bwd_result(
-    grads: Any, num_grad_inputs: Optional[int], op_qualname: str
+    grads: Any, num_grad_inputs: Optional[int], op_qualname: str, device: torch.device
 ) -> List[torch.Tensor]:
     """Pack a backward-impl return tuple into the op's ``Tensor[]`` payload.
 
@@ -903,10 +914,26 @@ def _pack_bwd_result(
     out: List[torch.Tensor] = []
     for g in grads:
         if isinstance(g, TensorSpec):
-            out.append(_encode_none(g.create_tensor()))
+            out.append(_encode_none(g.create_tensor(), device))
         else:
-            out.append(_encode_none(g))
+            out.append(_encode_none(g, device))
     return out
+
+
+def _op_device(flat: Sequence[Any]) -> torch.device:
+    """Device of an op call: that of its first non-CPU tensor argument (flat
+    args are tensors, ``Tensor[]`` lists, scalars and opaque values)."""
+    for value in flat:
+        for tensor in value if isinstance(value, (list, tuple)) else (value,):
+            if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
+                return tensor.device
+    return torch.device("cpu")
+
+
+def _fake_mode_active() -> bool:
+    """Whether the call is being traced (a ``FakeTensorMode`` is on the dispatch
+    stack: dynamo / AOT tracing, and the fake kernels torch runs under it)."""
+    return torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE) is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1022,47 +1049,41 @@ def _mark_effectful(op_def: Any) -> None:
         _register_effectful_op(op_def, EffectType.ORDERED)
 
 
+def _make_kernels(
+    plan: _ArgPlan,
+    impl: Callable[[Any], Any],
+    fake_impl: Callable[[Any], Any],
+    pack_result: Callable[[Any, torch.device], List[torch.Tensor]],
+) -> Tuple[Callable[..., List[torch.Tensor]], Callable[..., List[torch.Tensor]]]:
+    """The op's two kernels over its flat arguments: the real one rebuilds the
+    args dataclass and runs ``impl``; the fake one runs the spec fake impl on
+    the :func:`_spec_view`. Both pack their result through ``pack_result`` on
+    the call's device."""
+
+    def real(*flat: Any) -> List[torch.Tensor]:
+        return pack_result(impl(plan.unpack(flat)), _op_device(flat))
+
+    def fake(*flat: Any) -> List[torch.Tensor]:
+        spec_obj = _spec_view(plan.unpack(flat), plan.tensor_field_names())
+        return pack_result(fake_impl(spec_obj), _op_device(flat))
+
+    return real, fake
+
+
 def _register_base_op(
     *,
     op_name: str,
     schema_str: str,
-    plan: _ArgPlan,
-    impl: Callable[[Any], Any],
-    fake_impl: Callable[[Any], Any],
-    pack_result: Callable[[Any], List[torch.Tensor]],
+    real: Callable[..., List[torch.Tensor]],
+    fake: Callable[..., List[torch.Tensor]],
     tags: Sequence[torch.Tag] = (),
 ) -> Any:
-    """Define the op via ``torch.library.custom_op`` with the real ``impl`` + the
-    ``fake_impl`` (spec), returning the ``CustomOpDef``.
-
-    The real kernel rebuilds the dataclass and runs ``impl``; the fake kernel
-    runs the spec fake impl on the :func:`_spec_view`. Both go through
-    ``pack_result``.
-    """
-
-    def _pack_on_input_device(result: Any, flat: Sequence[Any]) -> List[torch.Tensor]:
-        device = torch.device("cpu")
-        for tensor in tree_flatten(flat)[0]:
-            if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
-                device = tensor.device
-                break
-        # Keep None sentinels on the op device for CUDA Graph partitioning.
-        with device:
-            return pack_result(result)
-
-    def _impl(*flat: Any) -> List[torch.Tensor]:
-        obj = plan.unpack(dict(zip(plan.slot_names, flat)))
-        return _pack_on_input_device(impl(obj), flat)
-
-    def _fake(*flat: Any) -> List[torch.Tensor]:
-        obj = plan.unpack(dict(zip(plan.slot_names, flat)))
-        spec_obj = _spec_view(obj, plan.tensor_field_names())
-        return _pack_on_input_device(fake_impl(spec_obj), flat)
-
+    """Define the base op via ``torch.library.custom_op`` with its real and fake
+    kernels, returning the ``CustomOpDef``."""
     op = torch.library.custom_op(
-        f"{_TE_OP_NAMESPACE}::{op_name}", _impl, mutates_args=(), schema=schema_str, tags=tags
+        f"{_TE_OP_NAMESPACE}::{op_name}", real, mutates_args=(), schema=schema_str, tags=tags
     )
-    op.register_fake(_fake)
+    op.register_fake(fake)
     _mark_effectful(op)
     return op
 
@@ -1089,7 +1110,7 @@ def _register_autograd_for_op(
 
     def _setup_context(ctx, inputs, output):
         ctx.fwd_tensor_list_lengths = {i: len(inputs[i]) for i in tensor_list_positions}
-        fwd_obj = fwd_plan.unpack(dict(zip(fwd_plan.slot_names, inputs)))
+        fwd_obj = fwd_plan.unpack(inputs)
         spec_obj = _spec_view(fwd_obj, fwd_plan.tensor_field_names())
 
         out_plan = _OutputPlan.parse(fwd_fake_impl(spec_obj))
@@ -1163,21 +1184,29 @@ def _flatten_subclass_into_slots(
 
 
 def _make_slot_forwarder(
-    base_op: Any, slot_offsets: Sequence[int], subclasses: Sequence[type]
+    base_op: Any,
+    real: Callable[..., List[torch.Tensor]],
+    slot_offsets: Sequence[int],
+    subclasses: Sequence[type],
 ) -> Callable[[Sequence[Any]], List[torch.Tensor]]:
-    """Return ``call(args)`` forwarding to ``base_op``, first flattening any
-    ``subclasses`` instance sitting in the tensor-or-quantized slot groups at
-    ``slot_offsets``.
+    """Return ``call(args)``, the wrapper op's one execution path (its body and
+    its ``register_torch_dispatch`` rules funnel through it -- see the two-tier
+    op note in the module docstring).
 
-    A ``torch.library`` op cannot take a tensor subclass directly, so the wrapper
-    op body and its ``register_torch_dispatch`` rules all funnel through this one
-    path -- see the two-tier op note in the module docstring. With no slots or no
-    subclasses to flatten it is a plain pass-through.
+    While tracing (a ``FakeTensorMode`` is active) it forwards to ``base_op``,
+    first flattening any ``subclasses`` instance sitting in the tensor-or-quantized
+    slot groups at ``slot_offsets``, so the base op's fake kernel sees the flat
+    schema a ``torch.library`` op can take. A real call runs the ``real`` kernel
+    directly on the wrapper's own arguments: the kernel takes a quantized-tensor
+    subclass whole, so nothing is flattened, rebuilt or dispatched a second time
+    per call.
     """
-    enabled = bool(slot_offsets) and bool(subclasses)
+    flatten = bool(slot_offsets) and bool(subclasses)
 
     def call(args: Sequence[Any]) -> List[torch.Tensor]:
-        if not enabled:
+        if not _fake_mode_active():
+            return real(*args)
+        if not flatten:
             return base_op(*args)
         new_args = list(args)
         for sub in subclasses:
@@ -1203,15 +1232,13 @@ def _register_wrapper_op(
     *,
     wrapper_op_name: str,
     schema_str: str,
-    base_op: Any,
-    slot_offsets: Sequence[int] = (),
-    subclasses: Sequence[type] = (),
+    forward: Callable[[Sequence[Any]], List[torch.Tensor]],
     tags: Sequence[torch.Tag] = (),
 ) -> Any:
-    """Define the wrapper op via ``torch.library.custom_op``: forward to the base
-    op through :func:`_make_slot_forwarder`. Returns the ``CustomOpDef``.
+    """Define the wrapper op via ``torch.library.custom_op`` over the
+    :func:`_make_slot_forwarder` path ``forward``, as both its real and its fake
+    kernel. Returns the ``CustomOpDef``.
     """
-    forward = _make_slot_forwarder(base_op, slot_offsets, subclasses)
 
     def _forward(*flat: Any) -> List[torch.Tensor]:
         return forward(flat)
@@ -1280,27 +1307,18 @@ def _register_op(
         if hasattr(namespace, registered_name):
             raise ValueError(f"Custom op '{_TE_OP_NAMESPACE}::{registered_name}' already exists")
 
+    real, fake = _make_kernels(plan, impl, fake_impl, pack_result)
     base_def = _register_base_op(
-        op_name=f"{name}_base",
-        schema_str=schema,
-        plan=plan,
-        impl=impl,
-        fake_impl=fake_impl,
-        pack_result=pack_result,
-        tags=tags,
+        op_name=f"{name}_base", schema_str=schema, real=real, fake=fake, tags=tags
     )
     base_op = getattr(namespace, f"{name}_base")
+    forward = _make_slot_forwarder(base_op, real, slot_offsets, subclasses)
     wrapper_def = _register_wrapper_op(
-        wrapper_op_name=name,
-        schema_str=schema,
-        base_op=base_op,
-        slot_offsets=slot_offsets,
-        subclasses=subclasses,
-        tags=tags,
+        wrapper_op_name=name, schema_str=schema, forward=forward, tags=tags
     )
     wrapper_op = getattr(namespace, name)
 
-    rule = _make_dispatch_rule(_make_slot_forwarder(base_op, slot_offsets, subclasses))
+    rule = _make_dispatch_rule(forward)
     for sub in subclasses:
         wrapper_def.register_torch_dispatch(sub, rule)
     _quantized_tensor_passthrough_ops.update((base_op.default, wrapper_op.default))
@@ -1335,9 +1353,9 @@ def register_custom_op(
     Duplicate operator names raise ValueError.
     """
 
-    def pack_result(result):
+    def pack_result(result, device):
         values, _ = tree_flatten(result)
-        return [tensor for value in values for tensor in _flatten_value(value)]
+        return [tensor for value in values for tensor in _flatten_value(value, device)]
 
     try:
         op = _register_op(
@@ -1488,7 +1506,9 @@ def _register_custom_op_with_autograd_impl(
         arg_type=bwd_arg_type,
         impl=bwd_impl,
         fake_impl=bwd_fake_impl,
-        pack_result=lambda grads: _pack_bwd_result(grads, num_grad_inputs, bwd_qualname),
+        pack_result=lambda grads, device: _pack_bwd_result(
+            grads, num_grad_inputs, bwd_qualname, device
+        ),
     )
 
     autograd_common = {
