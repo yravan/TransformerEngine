@@ -33,6 +33,14 @@ void sum_bias_grad(at::Tensor &bias, const at::Tensor &input) {
   }
 }
 
+// Per-tensor FP8 cast with a fused dbias: on SM 10.0+ for any usage, before that only as the
+// fused cast + transpose kernel (rowwise and columnwise usage).
+bool fused_dbias_cast_supported(const Quantizer &quantizer) {
+  auto prop = at::cuda::getCurrentDeviceProperties();
+  const size_t sm_arch = 10 * prop->major + prop->minor;
+  return sm_arch >= 100 || (quantizer.rowwise_usage && quantizer.columnwise_usage);
+}
+
 }  // namespace
 
 std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle quantizer) {
@@ -41,7 +49,7 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
 
   // Grad output tensor
   auto grad_output_torch = grad_output.contiguous();
-  const TensorWrapper &grad_output_nvte = makeTransformerEngineTensor(grad_output_torch);
+  TensorWrapper grad_output_nvte = makeTransformerEngineTensor(grad_output_torch);
   const auto shape = getTensorShape(grad_output_torch);
   auto grad_output_dtype = GetTransformerEngineDType(grad_output_torch.scalar_type());
 
@@ -72,16 +80,9 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
 
   // Check if fused kernel is supported
   bool with_fused_kernel = false;
-  if (detail::IsFloat8Quantizers(quantizer.ptr())) {
-    auto prop = at::cuda::getCurrentDeviceProperties();
-    const size_t sm_arch = 10 * prop->major + prop->minor;
-    if (sm_arch >= 100) {
-      // Fused kernel for dbias + FP8 cast on SM arch 10.0+
-      with_fused_kernel = true;
-    } else if (quantizer_cpp->rowwise_usage && quantizer_cpp->columnwise_usage) {
-      // Fused kernel for dbias + FP8 cast + FP8 transpose
-      with_fused_kernel = true;
-    }
+  if (detail::IsFloat8Quantizers(quantizer.ptr()) ||
+      detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) {
+    with_fused_kernel = fused_dbias_cast_supported(*quantizer_cpp);
   } else if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
     // Fused kernel for dbias + MXFP8 quantize
     with_fused_kernel = true;
@@ -91,6 +92,14 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   if (!with_fused_kernel) {
     sum_bias_grad(grad_bias_torch, grad_output_torch);
     quantizer_cpp->quantize(grad_output_nvte, grad_input_nvte);
+    return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
+  }
+
+  // Current scaling computes its scale from the input's amax before the fused cast
+  if (detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) {
+    auto *current_scaling = dynamic_cast<Float8CurrentScalingQuantizer *>(quantizer_cpp.get());
+    NVTE_CHECK(current_scaling != nullptr, "Invalid quantizer for fused dbias + FP8 cast");
+    current_scaling->quantize_with_dbias(grad_output_nvte, grad_input_nvte, grad_bias_nvte);
     return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
   }
 
@@ -222,7 +231,8 @@ std::vector<py::object> dact_dbias(
         break;
       }
     case Impl::FUSED_DACT_AMAX_FP8:
-      // Fused dact-amax kernel, unfused dbias and FP8 quantize
+      // Fused dact-amax kernel, then the FP8 cast with dbias fused where the cast kernel
+      // supports it (unfused dbias otherwise)
       {
         auto *fp8_quantizer_cpp =
             dynamic_cast<Float8CurrentScalingQuantizer *>(quantizer_cpp.get());
@@ -233,9 +243,14 @@ std::vector<py::object> dact_dbias(
         NVTE_SCOPED_GIL_RELEASE({
           dact_func(grad_output_nvte.data(), act_input_nvte.data(), temp_nvte.data(), stream);
         });
-        const auto temp_torch = temp_py.cast<at::Tensor>();
-        sum_bias_grad(grad_bias_torch, temp_torch);
-        fp8_quantizer_cpp->quantize_with_amax(temp_nvte, grad_input_nvte, amax_buf);
+        if (fused_dbias_cast_supported(*fp8_quantizer_cpp)) {
+          fp8_quantizer_cpp->quantize_with_dbias(temp_nvte, grad_input_nvte, grad_bias_nvte,
+                                                 amax_buf);
+        } else {
+          const auto temp_torch = temp_py.cast<at::Tensor>();
+          sum_bias_grad(grad_bias_torch, temp_torch);
+          fp8_quantizer_cpp->quantize_with_amax(temp_nvte, grad_input_nvte, amax_buf);
+        }
         break;
       }
     case Impl::FUSED_DACT_AMAX_NVFP4:

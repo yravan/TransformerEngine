@@ -49,6 +49,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <functional>
 #include <optional>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <vector>
@@ -259,11 +260,24 @@ class Float8CurrentScalingQuantizer : public Quantizer {
    */
   void quantize_with_amax(TensorWrapper& input, TensorWrapper& out, at::Tensor amax,
                           const std::optional<TensorWrapper>& noop_flag = std::nullopt);
+  /*! @brief Quantize to FP8 with the bias gradient fused into the cast
+   *
+   * `dbias` receives the reduction of the input along its leading
+   * dimensions. Without `amax` the local amax is computed first; with
+   * it, the given amax is used (and may still be reduced across the
+   * amax reduction group). The cast kernel must support a fused dbias
+   * for the quantizer's usage (see nvte_quantize_dbias).
+   */
+  void quantize_with_dbias(TensorWrapper& input, TensorWrapper& out, TensorWrapper& dbias,
+                           std::optional<at::Tensor> amax = std::nullopt);
 
  private:
+  using CastFn = std::function<void(const NVTETensor, NVTETensor, const NVTEQuantizationConfig,
+                                    cudaStream_t)>;
   void quantize_impl(const TensorWrapper& input, TensorWrapper& out,
                      const std::optional<TensorWrapper>& noop_flag, bool compute_amax,
-                     at::Tensor amax_buf, at::Tensor scale_buf);
+                     at::Tensor amax_buf, at::Tensor scale_buf,
+                     const CastFn& cast = nvte_quantize_v2);
 };
 
 class Float8BlockQuantizer : public Quantizer {

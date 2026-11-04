@@ -138,9 +138,15 @@ def _get_act_func_supported_list(
             "swiglu": (tex.swiglu, tex.dswiglu, None),
             "clamped_swiglu": (tex.clamped_swiglu, tex.clamped_dswiglu, None),
         }
-    if dbias_fusion is True or recipe.delayed() or recipe.mxfp8():
+    if (
+        dbias_fusion is True
+        or recipe.delayed()
+        or recipe.mxfp8()
+        or recipe.float8_current_scaling()
+    ):
         # Delayed scaling, fusion supported list: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
         # MXFP8: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
+        # Per-tensor current scaling: the same list (dact + amax fused, then cast + dbias fused)
         return {
             "gelu": (tex.gelu, tex.dgelu, tex.dbias_dgelu),
             "geglu": (tex.geglu, tex.dgeglu, None),
@@ -192,7 +198,7 @@ def _act_func(
     # bf16 (recipe is None): [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
     # Delayed scaling, fusion supported list: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
     # MXFP8: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
-    # Per-tensor current scaling or fp8 blockwise scaling: []
+    # Per-tensor current scaling: same as MXFP8; fp8 blockwise scaling: []
     funcs = _get_act_func_supported_list(recipe, dbias_fusion)
     if activation not in funcs:
         raise NotImplementedError("Activation type " + activation + " is not supported!")
@@ -3217,7 +3223,9 @@ class LayerNormMLP(TransformerEngineBaseModule):
                     wgrad_use_split_accumulator = _recipe.fp8_gemm_wgrad.use_split_accumulator
                 recipe_float8_block_scaling = _recipe.float8_block_scaling()
                 recipe_custom = _recipe.custom()
-                recipe_dbias_dact_fusion = _recipe.delayed() or _recipe.mxfp8()
+                recipe_dbias_dact_fusion = (
+                    _recipe.delayed() or _recipe.mxfp8() or _recipe.float8_current_scaling()
+                )
             else:
                 backward_override = None
 
