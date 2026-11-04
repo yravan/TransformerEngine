@@ -2520,6 +2520,7 @@ def test_te_ops_compile_delayed_scaling_first_call_runs_eagerly():
 
 
 @pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
+@pytest.mark.parametrize("backend", ["inductor", "eager"])
 @pytest.mark.parametrize("cache_quantized_input", [False, True])
 @pytest.mark.parametrize(
     "fp8_recipe",
@@ -2537,11 +2538,12 @@ def test_te_ops_compile_delayed_scaling_first_call_runs_eagerly():
         ),
     ],
 )
-def test_te_ops_swiglu_compiles_fullgraph(fp8_recipe, cache_quantized_input):
+def test_te_ops_swiglu_compiles_fullgraph(fp8_recipe, cache_quantized_input, backend):
     """te.ops.SwiGLU has forward and backward custom ops, so Linear -> SwiGLU -> Linear
     compiles as one graph under every value-opaque recipe, with the saved input kept or
     quantized, and matches eager. The eager warm-up builds the recipe state the compiled
-    call reads."""
+    call reads. The ``eager`` backend runs the traced graph as it is, so each op's real
+    kernel takes the quantized tensor its neighbour produced directly."""
     dtype, device = torch.bfloat16, "cuda"
     torch.manual_seed(0)
 
@@ -2572,7 +2574,7 @@ def test_te_ops_swiglu_compiles_fullgraph(fp8_recipe, cache_quantized_input):
     for param in (*model.parameters(), *ref.parameters()):
         param.grad = None
     torch._dynamo.reset()
-    compiled = torch.compile(model, fullgraph=True)
+    compiled = torch.compile(model, fullgraph=True, backend=backend)
     for _ in range(2):
         inp = torch.randn(32, 64, dtype=dtype, device=device)
         out_c, dx_c = step(compiled, inp)
