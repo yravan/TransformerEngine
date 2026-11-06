@@ -1114,16 +1114,46 @@ def test_dpa_torch_compile_dynamic(monkeypatch, backend):
     SymInts, and every configuration scalar (the softmax scale, the window) has
     to be specialized rather than baked into the opaque constant bundle.
 
-    Backend selection takes the sequence length as a constant, which is a graph
-    break under dynamic shapes, so this is not a full-graph test."""
+    Backend selection takes the batch size and the sequence lengths as constants
+    (``assume_constant_result``), so the module specializes them before selecting;
+    ``fullgraph=True`` makes the test fail if that specialization ever regresses
+    into a graph break."""
     dtype = torch.bfloat16
     spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
     module = _make_dpa(spec, dtype)
     args, kwargs, grads = _make_dpa_inputs(spec, dtype)
     _skip_unsupported(spec, backend, dtype)
     _compare_compiled_to_eager(
-        module, args, kwargs, grads, monkeypatch, backend, dtype, dynamic=True
+        module, args, kwargs, grads, monkeypatch, backend, dtype, dynamic=True, fullgraph=True
     )
+
+
+@pytest.mark.parametrize("backend", ["flash", "fused"])
+def test_dpa_compile_alternating_batch_sizes(monkeypatch, backend):
+    """Callers with two batch sizes alternate through one compiled DotProductAttention:
+    one graph per batch size, then cache hits. Eager calls memoize backend selection in
+    a process-global cache; a compiled call must not read it, or its graph guards on
+    whichever call ran last and recompiles on every switch. One eager call first, as
+    every compile here: it settles the module's lazily set state (activation dtype), which
+    a cold compiled call would otherwise bake into its first graph and recompile once."""
+    dtype = torch.bfloat16
+    spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
+    _skip_unsupported(spec, backend, dtype)
+    _force_dpa_backend(monkeypatch, backend)
+    module = _make_dpa(spec, dtype)
+    config = spec["model_config"]
+
+    def qkv(batch_size):
+        shape = (batch_size, config.max_seqlen_q, config.num_heads, config.head_dim_qk)
+        return [torch.randn(shape, dtype=dtype, device="cuda") for _ in range(3)]
+
+    module(*qkv(2))
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("eager")
+    compiled = torch.compile(module, backend=counter, fullgraph=True)
+    for batch_size in (2, 4, 2, 4, 2, 4):
+        compiled(*qkv(batch_size))
+    assert counter.frame_count == 2
 
 
 @pytest.mark.parametrize("backend", ["flash", "fused", "unfused"])
