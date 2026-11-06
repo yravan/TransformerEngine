@@ -42,6 +42,60 @@ constexpr size_t SHMEM_DIM_X = BUFFER_DIM_X;  // 128
 constexpr size_t BUFFER_STAGES_NUM = BUFFER_DIM_Y / THREADS_PER_CHUNK_Y;  //  8 =  32 / 4
 constexpr size_t ITERATIONS = CHUNK_DIM_Y / BUFFER_DIM_Y;                 //  4 = 128 / 32
 static_assert(ITERATIONS >= 1);
+static_assert(BUFFER_STAGES_NUM % 2 == 0);
+
+template <typename ParamOP, float (*OP)(float, const ParamOP &), float (*REF)(float, const Empty &)>
+__device__ constexpr bool is_op() {
+  if constexpr (std::is_same<ParamOP, Empty>::value) {
+    return OP == REF;
+  } else {
+    return false;
+  }
+}
+
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__device__ __forceinline__ float2 splat_x2(const float v) { return make_float2(v, v); }
+
+// __frcp_rn for d >= 1, two lanes at a time: one Newton step from rcp.approx, with the
+// correctly rounded scalar path where the approximation flushes (d >= 2^126) or d is NaN.
+__device__ __forceinline__ float2 rcp_rn_x2(const float2 d) {
+  float2 r;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r.x) : "f"(d.x));
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r.y) : "f"(d.y));
+  r = __ffma2_rn(r, __ffma2_rn(make_float2(-d.x, -d.y), r, splat_x2(1.f)), r);
+  constexpr float limit = 0x1p126f;
+  if (!(d.x < limit && d.y < limit)) {
+    r = make_float2(__frcp_rn(d.x), __frcp_rn(d.y));
+  }
+  return r;
+}
+
+// silu<fp32, fp32> (x / (1 + expf(-x))) as libdevice computes it, two lanes at a time.
+__device__ __forceinline__ float2 silu_x2(const float2 x) {
+  const float2 t = __ffma2_rn(x, splat_x2(__int_as_float(0xBBBB989D)), splat_x2(0.5f));
+  const float2 j = __ffma2_rd(make_float2(__saturatef(t.x), __saturatef(t.y)),
+                              splat_x2(__int_as_float(0x437C0000)),
+                              splat_x2(__int_as_float(0x4B400001)));
+  float2 r = __ffma2_rn(j, splat_x2(-1.f), splat_x2(__int_as_float(0x4B40007F)));
+  r = __ffma2_rn(x, splat_x2(__int_as_float(0xBFB8AA3B)), r);
+  r = __ffma2_rn(x, splat_x2(__int_as_float(0xB2A57060)), r);
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(r.x));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(r.y));
+  const float2 two_j = make_float2(__int_as_float(__float_as_int(j.x) << 23),
+                                   __int_as_float(__float_as_int(j.y) << 23));
+  return __fmul2_rn(x, rcp_rn_x2(__ffma2_rn(r, two_j, splat_x2(1.f))));
+}
+
+// sigmoidf(x), then x * s and dsilu = x * s * (1 - s) + s, two lanes at a time.
+__device__ __forceinline__ void silu_dsilu_x2(const float2 x, float2 &act, float2 &dact) {
+  float2 e = __fmul2_rn(x, splat_x2(__int_as_float(0xBFB8AA3B)));
+  asm("ex2.approx.f32 %0, %0;" : "+f"(e.x));
+  asm("ex2.approx.f32 %0, %0;" : "+f"(e.y));
+  const float2 s = rcp_rn_x2(__fadd2_rn(e, splat_x2(1.f)));
+  act = __fmul2_rn(x, s);
+  dact = __ffma2_rn(act, __ffma2_rn(s, splat_x2(-1.f), splat_x2(1.f)), s);
+}
+#endif  // #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 template <bool IS_BWD, typename ParamOP, float (*ActOP)(float, const ParamOP &),
           float (*DActOP)(float, const ParamOP &), typename IType, typename OType>
@@ -158,65 +212,92 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
     OType *out_act_sh_curr = out_act_sh + buff * buff_elems;
     OType *out_gate_sh_curr = out_gate_sh + buff * buff_elems;
 #pragma unroll
-    for (int stage = 0; stage < BUFFER_STAGES_NUM; ++stage) {
-      const size_t stage_offset_Y = stage * THREADS_PER_CHUNK_Y;
-      const size_t shmem_offset_y = thread_offset_Y + stage_offset_Y;
-      const size_t shmem_offset_x = thread_offset_X;
-      const size_t shmem_idx = shmem_offset_y * SHMEM_DIM_X + shmem_offset_x;
+    for (int stage = 0; stage < BUFFER_STAGES_NUM; stage += 2) {
+      size_t shmem_idx[2];
+      float act_elt[2];
+      float gate_elt[2];
+      float dgate_elt[2];
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const size_t stage_offset_Y = (stage + i) * THREADS_PER_CHUNK_Y;
+        const size_t shmem_offset_y = thread_offset_Y + stage_offset_Y;
+        const size_t shmem_offset_x = thread_offset_X;
+        shmem_idx[i] = shmem_offset_y * SHMEM_DIM_X + shmem_offset_x;
 
-      float act_elt = static_cast<float>(in_act_sh_curr[shmem_idx]);
-      float gate_elt = static_cast<float>(in_gate_sh_curr[shmem_idx]);
-      float dgate_elt = 1.0f;  // gating is ideally an identity function
-      if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-        if (gate_elt > p.limit || gate_elt < -p.limit) {
-          dgate_elt = 0.f;
+        act_elt[i] = static_cast<float>(in_act_sh_curr[shmem_idx[i]]);
+        gate_elt[i] = static_cast<float>(in_gate_sh_curr[shmem_idx[i]]);
+        dgate_elt[i] = 1.0f;  // gating is ideally an identity function
+        if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
+          if (gate_elt[i] > p.limit || gate_elt[i] < -p.limit) {
+            dgate_elt[i] = 0.f;
+          }
+          gate_elt[i] = min(max(-p.limit, gate_elt[i]), p.limit) + p.glu_linear_offset;
+        } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
+          dgate_elt[i] = dsitu_up<float, float>(gate_elt[i], p);
+          gate_elt[i] = situ_up<float, float>(gate_elt[i], p);
         }
-        gate_elt = min(max(-p.limit, gate_elt), p.limit) + p.glu_linear_offset;
-      } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
-        dgate_elt = dsitu_up<float, float>(gate_elt, p);
-        gate_elt = situ_up<float, float>(gate_elt, p);
       }
 
       if constexpr (IS_BWD) {
-        float grad_elt = static_cast<float>(in_grad_sh_curr[shmem_idx]);
+        float2 act_x2;
+        float2 dact_x2;
+        if constexpr (is_op<ParamOP, ActOP, silu<fp32, fp32>>() &&
+                      is_op<ParamOP, DActOP, dsilu<fp32, fp32>>()) {
+          silu_dsilu_x2(make_float2(act_elt[0], act_elt[1]), act_x2, dact_x2);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          float grad_elt = static_cast<float>(in_grad_sh_curr[shmem_idx[i]]);
 
-        const float x = act_elt;
-        float act_x;
-        float dact_x;
-        if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-          const float x = min(act_elt, p.limit);
-          const float s = sigmoidf(p.alpha * x);
-          act_x = x * s;
-          if (act_elt <= p.limit) {
-            dact_x = s + s * (1 - s) * p.alpha * x;
-          } else {
-            dact_x = 0.0f;
-          }
-        } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
-          act_x = ActOP(x, p);
-          dact_x = DActOP(x, p);
-        } else {
-          if constexpr ((ActOP == &silu<fp32, fp32>) && (DActOP == &dsilu<fp32, fp32>)) {
-            const float s = sigmoidf(x);
+          const float x = act_elt[i];
+          float act_x;
+          float dact_x;
+          if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
+            const float x = min(act_elt[i], p.limit);
+            const float s = sigmoidf(p.alpha * x);
             act_x = x * s;
-            dact_x = x * s * (1 - s) + s;
-          } else {
+            if (act_elt[i] <= p.limit) {
+              dact_x = s + s * (1 - s) * p.alpha * x;
+            } else {
+              dact_x = 0.0f;
+            }
+          } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
             act_x = ActOP(x, p);
             dact_x = DActOP(x, p);
+          } else {
+            if constexpr ((ActOP == &silu<fp32, fp32>) && (DActOP == &dsilu<fp32, fp32>)) {
+              act_x = i == 0 ? act_x2.x : act_x2.y;
+              dact_x = i == 0 ? dact_x2.x : dact_x2.y;
+            } else {
+              act_x = ActOP(x, p);
+              dact_x = DActOP(x, p);
+            }
           }
+          float after_dact = dact_x * grad_elt * gate_elt[i];
+          float after_dgate = dgate_elt[i] * act_x * grad_elt;
+
+          out_act_sh_curr[shmem_idx[i]] = static_cast<OType>(scale * after_dact);
+          out_gate_sh_curr[shmem_idx[i]] = static_cast<OType>(scale * after_dgate);
+
+          amax = fmaxf(amax, fabsf(after_dact));
+          amax = fmaxf(amax, fabsf(after_dgate));
         }
-        float after_dact = dact_x * grad_elt * gate_elt;
-        float after_dgate = dgate_elt * act_x * grad_elt;
-
-        out_act_sh_curr[shmem_idx] = static_cast<OType>(scale * after_dact);
-        out_gate_sh_curr[shmem_idx] = static_cast<OType>(scale * after_dgate);
-
-        amax = fmaxf(amax, fabsf(after_dact));
-        amax = fmaxf(amax, fabsf(after_dgate));
       } else {
-        const float after_act = ActOP(act_elt, p) * gate_elt;
-        out_act_sh_curr[shmem_idx] = static_cast<OType>(scale * after_act);
-        amax = fmaxf(amax, fabsf(after_act));
+        float act_x[2];
+        if constexpr (is_op<ParamOP, ActOP, silu<fp32, fp32>>()) {
+          const float2 silu_x = silu_x2(make_float2(act_elt[0], act_elt[1]));
+          act_x[0] = silu_x.x;
+          act_x[1] = silu_x.y;
+        } else {
+          act_x[0] = ActOP(act_elt[0], p);
+          act_x[1] = ActOP(act_elt[1], p);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const float after_act = act_x[i] * gate_elt[i];
+          out_act_sh_curr[shmem_idx[i]] = static_cast<OType>(scale * after_act);
+          amax = fmaxf(amax, fabsf(after_act));
+        }
       }
     }
 

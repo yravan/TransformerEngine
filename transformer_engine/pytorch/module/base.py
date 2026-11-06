@@ -95,6 +95,18 @@ _MIN_STREAM_PRIORITY, _MAX_STREAM_PRIORITY = None, None
 layers_atomic_ring_exchange = []
 
 
+@torch.compiler.disable
+def forward_eagerly(module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
+    """Run ``module.forward`` outside dynamo, as one graph break at the call.
+
+    For a call that has no compiled path (``recipe_compile_fallback_reason``). The eager
+    forward is not traceable past its first extension call, and tracing up to it would
+    guard the frame on the module's lazily built state, which recompiles the frame for
+    every other instance that shares it.
+    """
+    return module.forward(*args, **kwargs)
+
+
 def _get_high_precision_init_val(parameter: torch.Tensor) -> Optional[torch.Tensor]:
     """Return temporary pre-quantization initialization stored on a parameter."""
     return getattr(parameter, "_high_precision_init_val", None)
@@ -1391,6 +1403,18 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} class does not implement _get_weight_quantizers function"
         )
+
+    def _call_quantizer(self, meta_key: str, index: int) -> Quantizer:
+        """A copy of a stored quantizer for one forward call.
+
+        The forward configures usage and layout for the call it serves on the
+        copy, so the stored quantizer only ever holds recipe state (scale and
+        amax buffers, reduction group). A compiled forward guards on the stored
+        quantizers by value, and that guard holds across every instance sharing
+        the code and across the usage flips between forward and backward only
+        because no call mutates them.
+        """
+        return self.quantizers[meta_key][index].copy()
 
     def _enable_weight_preswizzle(
         self,

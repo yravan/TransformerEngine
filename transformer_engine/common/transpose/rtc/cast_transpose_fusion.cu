@@ -48,7 +48,9 @@ constexpr OP ActivationList[] = {
     &relu<CType, CType>,      // 9
     &drelu<CType, CType>,     // 10
     &srelu<CType, CType>,     // 11
-    &dsrelu<CType, CType>     // 12
+    &dsrelu<CType, CType>,    // 12
+    &gelu_erf<CType, CType>,  // 13
+    &dgelu_erf<CType, CType>  // 14
 };
 
 }  // namespace

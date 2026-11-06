@@ -11,6 +11,7 @@
 #ifndef TRANSFORMER_ENGINE_QUANTIZE_FP8_CUH_
 #define TRANSFORMER_ENGINE_QUANTIZE_FP8_CUH_
 
+#include "../../util/activation_x2.cuh"
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
@@ -35,6 +36,7 @@
 namespace transformer_engine {
 namespace dispatch {
 namespace fp8 {
+
 namespace quantize_2D_kernel {
 
 constexpr size_t FP8_CHUNK_DIM_Y = 128;
@@ -146,39 +148,49 @@ __global__ void __launch_bounds__(FP8_THREADS_PER_CHUNK)
     ptx::mbarrier_wait_parity(&mbar[iter], parity);
 
 #pragma unroll
-    for (int stage = 0; stage < FP8_BUFF_STAGES_NUM; ++stage) {
+    for (int stage = 0; stage < FP8_BUFF_STAGES_NUM; stage += 2) {
       const size_t stage_offset_Y = stage;
       const size_t shmem_offset_y = thread_offset_Y + stage_offset_Y;
       const size_t shmem_offset_x = thread_offset_X;
       const size_t row = row_base + shmem_offset_y;
-      const bool row_out_of_bounds = row >= rows;
-      const bool out_of_bounds = col_out_of_bounds || row_out_of_bounds;
 
-      float elt = static_cast<float>(in_sh[buff][shmem_offset_y][shmem_offset_x]);
+      float elts[2] = {static_cast<float>(in_sh[buff][shmem_offset_y][shmem_offset_x]),
+                       static_cast<float>(in_sh[buff][shmem_offset_y + 1][shmem_offset_x])};
       if constexpr (IS_DACT) {
-        float act_in_elt = static_cast<float>(act_in_sh[buff][shmem_offset_y][shmem_offset_x]);
-        elt *= OP(act_in_elt, {});
+        const float2 dact = op_x2<ParamOP, OP>(
+            make_float2(static_cast<float>(act_in_sh[buff][shmem_offset_y][shmem_offset_x]),
+                        static_cast<float>(act_in_sh[buff][shmem_offset_y + 1][shmem_offset_x])));
+        const float2 grad_dact = __fmul2_rn(make_float2(elts[0], elts[1]), dact);
+        elts[0] = grad_dact.x;
+        elts[1] = grad_dact.y;
       }
-      if constexpr (IS_DBIAS) {
-        if constexpr (IS_DACT) {
-          if (!out_of_bounds) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const float elt = elts[i];
+        const bool out_of_bounds = col_out_of_bounds || (row + i >= rows);
+        if constexpr (IS_DBIAS) {
+          if constexpr (IS_DACT) {
+            if (!out_of_bounds) {
+              partial_dbias += elt;
+            }
+          } else {
+            // If no activation, elt is 0 so we can safely do this
             partial_dbias += elt;
+          }
+        }
+        __builtin_assume(amax >= 0);
+        if (IS_DACT) {
+          if (!out_of_bounds) {
+            amax = fmaxf(amax, fabsf(elt));
           }
         } else {
           // If no activation, elt is 0 so we can safely do this
-          partial_dbias += elt;
-        }
-      }
-      __builtin_assume(amax >= 0);
-      if (IS_DACT) {
-        if (!out_of_bounds) {
           amax = fmaxf(amax, fabsf(elt));
         }
-      } else {
-        // If no activation, elt is 0 so we can safely do this
-        amax = fmaxf(amax, fabsf(elt));
       }
-      out_sh[buff][shmem_offset_y][shmem_offset_x] = static_cast<OType>(elt * scale);
+      const float2 scaled = __fmul2_rn(make_float2(elts[0], elts[1]), splat2(scale));
+      out_sh[buff][shmem_offset_y][shmem_offset_x] = static_cast<OType>(scaled.x);
+      out_sh[buff][shmem_offset_y + 1][shmem_offset_x] = static_cast<OType>(scaled.y);
     }
 
     // Wait for shared memory writes to be visible to TMA engine.
@@ -312,15 +324,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
     ptx::mbarrier_wait_parity(&mbar[iter], parity);
 
 #pragma unroll
-    for (int chunk = 0; chunk < CHUNKS_PER_ITERATION; ++chunk) {
+    for (int chunk = 0; chunk < CHUNKS_PER_ITERATION; chunk += 2) {
       const size_t shmem_offset = chunk * CHUNK_SIZE + threadIdx.x;
-      float elt = static_cast<float>(in_sh[buff][shmem_offset]);
+      float2 elt = make_float2(static_cast<float>(in_sh[buff][shmem_offset]),
+                               static_cast<float>(in_sh[buff][shmem_offset + CHUNK_SIZE]));
       if constexpr (IS_ACT) {
-        elt = OP(elt, {});
+        elt = op_x2<ParamOP, OP>(elt);
       }
       __builtin_assume(amax >= 0);
-      amax = fmaxf(amax, fabsf(elt));
-      out_sh[buff][shmem_offset] = static_cast<OType>(elt * scale);
+      amax = fmaxf(amax, fabsf(elt.x));
+      amax = fmaxf(amax, fabsf(elt.y));
+      out_sh[buff][shmem_offset] = static_cast<OType>(elt.x * scale);
+      out_sh[buff][shmem_offset + CHUNK_SIZE] = static_cast<OType>(elt.y * scale);
     }
 
     // Wait for shared memory writes to be visible to TMA engine.

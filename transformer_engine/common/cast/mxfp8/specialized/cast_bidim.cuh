@@ -14,8 +14,11 @@
 #include <cuda_runtime.h>
 
 #include "../../../common.h"
+#include "../../../util/math.h"
 #include "../../../util/ptx.cuh"
 #include "../../../utils.cuh"
+#include "../../../util/activation_x2.cuh"
+#include "../swizzle.cuh"
 
 namespace transformer_engine {
 namespace dispatch {
@@ -270,6 +273,23 @@ __device__ __forceinline__ void load_shared_words(uint32_t *dst, const uint32_t 
   }
 }
 
+/*! \brief The activation (and its gradient) of one BF16 word pair, rounded back to BF16 pairs.
+ *
+ * \param value  FP32 result before the BF16 rounding, kept for the bias gradient.
+ */
+template <bool IS_ACT, bool IS_DACT, typename ParamOP, float (*OP)(float, const ParamOP &)>
+__device__ __forceinline__ uint32_t activate_word(const uint32_t in_word, const uint32_t act_word,
+                                                  float2 &value) {
+  const float2 in = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 &>(in_word));
+  float2 act_in = make_float2(0.f, 0.f);
+  if constexpr (IS_DACT) {
+    act_in = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 &>(act_word));
+  }
+  value = activate_x2<IS_ACT, IS_DACT, ParamOP, OP>(in, act_in);
+  const __nv_bfloat162 rounded = __floats2bfloat162_rn(value.x, value.y);
+  return reinterpret_cast<const uint32_t &>(rounded);
+}
+
 /*! \brief Quantize a 32-row band crossed with a strip of columns.
  *
  * \tparam COLS_PER_LANE     Columns one lane owns.  16 gives a 32x512 tile read
@@ -282,12 +302,15 @@ __device__ __forceinline__ void load_shared_words(uint32_t *dst, const uint32_t 
  *                           them at run time.
  * \tparam MIN_BLOCKS_PER_SM Occupancy target for __launch_bounds__.
  */
-template <typename OType, int32_t COLS_PER_LANE, int32_t K_COMPILE_TIME, int32_t MIN_BLOCKS_PER_SM>
+template <typename OType, int32_t COLS_PER_LANE, int32_t K_COMPILE_TIME, int32_t MIN_BLOCKS_PER_SM,
+          bool SWIZZLED_SCALES, bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
+          float (*OP)(float, const ParamOP &)>
 __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bidim_kernel(
-    const uint8_t *__restrict__ input, uint8_t *__restrict__ output_rowwise,
-    uint8_t *__restrict__ scales_rowwise, uint8_t *__restrict__ output_colwise,
-    uint8_t *__restrict__ scales_colwise, int32_t cols_rt, int32_t scale_stride_rowwise_rt,
-    int32_t scale_stride_colwise_rt) {
+    const uint8_t *__restrict__ input, const uint8_t *__restrict__ act_input,
+    uint8_t *__restrict__ output_rowwise, uint8_t *__restrict__ scales_rowwise,
+    uint8_t *__restrict__ output_colwise, uint8_t *__restrict__ scales_colwise,
+    float *__restrict__ dbias_workspace, int32_t rows, int32_t cols_rt,
+    int32_t scale_stride_rowwise_rt, int32_t scale_stride_colwise_rt) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   const int32_t cols = K_COMPILE_TIME ? K_COMPILE_TIME : cols_rt;
   const int32_t scale_stride_rowwise =
@@ -357,6 +380,61 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
     }
   }
 
+  constexpr bool kActivates = IS_ACT || IS_DACT;
+  if constexpr (kActivates) {
+    // The activation is evaluated in FP32 and rounded to BF16 once; the quantization below only
+    // ever sees the rounded values, exactly as if the activation had run as a separate kernel.
+    uint32_t act_tile[kRowsPerWarp][IS_DACT ? kWordsPerLane : 1];
+    if constexpr (IS_DACT) {
+      const uint8_t *act_in = act_input + lane_offset * sizeof(bf16);
+#pragma unroll
+      for (int32_t i = 0; i < kRowsPerWarp; ++i) {
+        const void *src = act_in + i * row_stride_bytes;
+        if constexpr (kWordsPerLane == 8) {
+          ptx::ld_global_nc_b32x8(act_tile[i], src, policy);
+        } else {
+          ptx::ld_global_nc_b32x4(act_tile[i], src, policy);
+        }
+      }
+    }
+    float column_sum[IS_DBIAS ? COLS_PER_LANE : 1];
+    if constexpr (IS_DBIAS) {
+#pragma unroll
+      for (int32_t c = 0; c < COLS_PER_LANE; ++c) {
+        column_sum[c] = 0.f;
+      }
+    }
+#pragma unroll
+    for (int32_t i = 0; i < kRowsPerWarp; ++i) {
+#pragma unroll
+      for (int32_t k = 0; k < kWordsPerLane; ++k) {
+        float2 value;
+        tile[i][k] = activate_word<IS_ACT, IS_DACT, ParamOP, OP>(
+            tile[i][k], IS_DACT ? act_tile[i][k] : 0u, value);
+        if constexpr (IS_DBIAS) {
+          column_sum[2 * k] += value.x;
+          column_sum[2 * k + 1] += value.y;
+        }
+      }
+    }
+    if constexpr (IS_DBIAS) {
+      __shared__ float s_dbias[kWarpsPerCta][kColsPerTile];
+#pragma unroll
+      for (int32_t c = 0; c < COLS_PER_LANE; ++c) {
+        s_dbias[warp][COLS_PER_LANE * lane + c] = column_sum[c];
+      }
+      __syncthreads();
+      for (int32_t c = tid; c < kColsPerTile; c += kThreadsPerCta) {
+        float sum = s_dbias[0][c];
+#pragma unroll
+        for (int32_t w = 1; w < kWarpsPerCta; ++w) {
+          sum += s_dbias[w][c];
+        }
+        dbias_workspace[static_cast<size_t>(blockIdx.y) * cols + col0 + c] = sum;
+      }
+    }
+  }
+
   // ---- rowwise pass -------------------------------------------------------
 #pragma unroll
   for (int32_t i = 0; i < kRowsPerWarp; ++i) {
@@ -388,8 +466,16 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
     store_words(out_row + static_cast<size_t>(i) * cols, out_words, policy);
 
     if (owns_row_scale) {
-      ptx::st_global_b8(scale_row + static_cast<size_t>(i) * scale_stride_rowwise,
-                        mx_scale_byte(reciprocal), policy);
+      if constexpr (SWIZZLED_SCALES) {
+        ptx::st_global_b8(scales_rowwise +
+                              swizzle::gemm_swizzled_scale_idx(
+                                  row0 + i, col0 / kBlockElems + lane / kLanesPerRowBlock,
+                                  DIVUP(cols, 128)),
+                          mx_scale_byte(reciprocal), policy);
+      } else {
+        ptx::st_global_b8(scale_row + static_cast<size_t>(i) * scale_stride_rowwise,
+                          mx_scale_byte(reciprocal), policy);
+      }
     }
   }
 
@@ -455,7 +541,19 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
 
   // Warp 0 emits the colwise scale row: one byte per column, one coalesced
   // vector store per lane.
-  if (warp == 0) {
+  if (warp == 0 && SWIZZLED_SCALES) {
+#pragma unroll
+    for (int32_t c = 0; c < COLS_PER_LANE; c += 2) {
+      const uint32_t pair_bytes = mx_scale_byte_x2(column_reciprocal[c / 2]);
+#pragma unroll
+      for (int32_t h = 0; h < 2; ++h) {
+        ptx::st_global_b8(scales_colwise + swizzle::gemm_swizzled_scale_idx(
+                                               col0 + COLS_PER_LANE * lane + c + h, blockIdx.y,
+                                               DIVUP(rows, 128)),
+                          (pair_bytes >> (8 * h)) & 0xFFu, policy);
+      }
+    }
+  } else if (warp == 0) {
     uint32_t packed[kOutWordsPerLane];
 #pragma unroll
     for (int32_t j = 0; j < kOutWordsPerLane; ++j) {
@@ -513,9 +611,12 @@ constexpr int64_t kWideDeepClusterFrom = 4096;
  * anything else takes the run-time path, which costs a few address
  * computations rather than a recompile.
  */
-template <typename OType, int32_t COLS_PER_LANE, int32_t MIN_BLOCKS_PER_SM>
-void launch_tiled(const void *input, void *output_rowwise, void *scales_rowwise,
-                  void *output_colwise, void *scales_colwise, int32_t rows, int32_t cols,
+template <typename OType, int32_t COLS_PER_LANE, int32_t MIN_BLOCKS_PER_SM,
+          bool SWIZZLED_SCALES, bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
+          float (*OP)(float, const ParamOP &)>
+void launch_tiled(const void *input, const void *act_input, void *output_rowwise,
+                  void *scales_rowwise, void *output_colwise, void *scales_colwise,
+                  float *dbias_workspace, int32_t rows, int32_t cols,
                   int32_t scale_stride_rowwise, int32_t scale_stride_colwise, int32_t cluster_width,
                   cudaStream_t stream) {
   constexpr int32_t kColsPerTile = THREADS_PER_WARP * COLS_PER_LANE;
@@ -546,6 +647,7 @@ void launch_tiled(const void *input, void *output_rowwise, void *scales_rowwise,
   config.numAttrs = 1;
 
   const uint8_t *in = reinterpret_cast<const uint8_t *>(input);
+  const uint8_t *act_in = reinterpret_cast<const uint8_t *>(act_input);
   uint8_t *qrow = reinterpret_cast<uint8_t *>(output_rowwise);
   uint8_t *srow = reinterpret_cast<uint8_t *>(scales_rowwise);
   uint8_t *qcol = reinterpret_cast<uint8_t *>(output_colwise);
@@ -553,12 +655,15 @@ void launch_tiled(const void *input, void *output_rowwise, void *scales_rowwise,
 
 #define NVTE_LAUNCH_BIDIM(K_CONST)                                                             \
   do {                                                                                         \
-    auto kernel = quantize_bidim_kernel<OType, COLS_PER_LANE, K_CONST, MIN_BLOCKS_PER_SM>;     \
+    auto kernel = quantize_bidim_kernel<OType, COLS_PER_LANE, K_CONST, MIN_BLOCKS_PER_SM,      \
+                                        SWIZZLED_SCALES, IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP>; \
     if (cluster_x > 1) {                                                                       \
-      NVTE_CHECK_CUDA(cudaLaunchKernelEx(&config, kernel, in, qrow, srow, qcol, scol, cols,    \
-                                         scale_stride_rowwise, scale_stride_colwise));         \
+      NVTE_CHECK_CUDA(cudaLaunchKernelEx(&config, kernel, in, act_in, qrow, srow, qcol, scol,  \
+                                         dbias_workspace, rows, cols, scale_stride_rowwise,    \
+                                         scale_stride_colwise));                               \
     } else {                                                                                   \
-      kernel<<<grid, kThreadsPerCta, 0, stream>>>(in, qrow, srow, qcol, scol, cols,            \
+      kernel<<<grid, kThreadsPerCta, 0, stream>>>(in, act_in, qrow, srow, qcol, scol,          \
+                                                  dbias_workspace, rows, cols,                 \
                                                   scale_stride_rowwise, scale_stride_colwise); \
       NVTE_CHECK_CUDA(cudaGetLastError());                                                     \
     }                                                                                          \
@@ -612,11 +717,12 @@ void launch_tiled(const void *input, void *output_rowwise, void *scales_rowwise,
  *  \param[in]  scale_stride_colwise  Colwise scale elements per 32-row band.
  *  \param[in]  stream                CUDA stream.
  */
-template <typename OType>
-void launch_cast_bidim_packed(const void *input, void *output_rowwise, void *scales_rowwise,
-                              void *output_colwise, void *scales_colwise, int rows, int cols,
-                              int scale_stride_rowwise, int scale_stride_colwise,
-                              cudaStream_t stream) {
+template <typename OType, bool SWIZZLED_SCALES, bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
+          float (*OP)(float, const ParamOP &)>
+void launch_cast_bidim_packed(const void *input, const void *act_input, void *output_rowwise,
+                              void *scales_rowwise, void *output_colwise, void *scales_colwise,
+                              float *dbias_workspace, int rows, int cols, int scale_stride_rowwise,
+                              int scale_stride_colwise, cudaStream_t stream) {
   constexpr int32_t kWideColsPerTile = THREADS_PER_WARP * kWideColsPerLane;
   constexpr int32_t kNarrowColsPerTile = THREADS_PER_WARP * kNarrowColsPerLane;
 
@@ -627,37 +733,40 @@ void launch_cast_bidim_packed(const void *input, void *output_rowwise, void *sca
 
   if (cols % kWideColsPerTile == 0) {
     const int64_t wide_ctas = static_cast<int64_t>(rows / kRowsPerTile) * (cols / kWideColsPerTile);
-    launch_tiled<OType, kWideColsPerLane, kWideMinBlocksPerSm>(
-        input, output_rowwise, scales_rowwise, output_colwise, scales_colwise, rows, cols,
-        scale_stride_rowwise, scale_stride_colwise,
+    launch_tiled<OType, kWideColsPerLane, kWideMinBlocksPerSm, SWIZZLED_SCALES, IS_DBIAS, IS_DACT,
+                 IS_ACT, ParamOP, OP>(
+        input, act_input, output_rowwise, scales_rowwise, output_colwise, scales_colwise,
+        dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise,
         wide_ctas >= kWideDeepClusterFrom ? kWideClusterDeep : kWideClusterShallow, stream);
     return;
   }
 
   // Deep grid, or a column count that only the narrow tile divides.
-  launch_tiled<OType, kNarrowColsPerLane, kNarrowMinBlocksPerSm>(
-      input, output_rowwise, scales_rowwise, output_colwise, scales_colwise, rows, cols,
-      scale_stride_rowwise, scale_stride_colwise, kNarrowCluster, stream);
+  launch_tiled<OType, kNarrowColsPerLane, kNarrowMinBlocksPerSm, SWIZZLED_SCALES, IS_DBIAS,
+               IS_DACT, IS_ACT, ParamOP, OP>(
+      input, act_input, output_rowwise, scales_rowwise, output_colwise, scales_colwise,
+      dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise, kNarrowCluster,
+      stream);
 }
 
-/*! \brief Entry point.  Rejects swizzled scales at compile time; see above. */
-template <typename OType, bool SWIZZLED_SCALES = false>
-inline void launch_cast_bidim(const void *input, void *output_rowwise, void *scales_rowwise,
-                              void *output_colwise, void *scales_colwise, int rows, int cols,
-                              int scale_stride_rowwise, int scale_stride_colwise,
-                              cudaStream_t stream) {
-  static_assert(!SWIZZLED_SCALES,
-                "launch_cast_bidim writes packed scales for both directions.  The GEMM-swizzled "
-                "layout is a property of the whole tensor, so emitting it for the rowwise array "
-                "while leaving the colwise one packed produces a tensor no consumer can read, and "
-                "the colwise swizzle is not implemented here.  Route swizzled bidimensional casts "
-                "to the staged kernel instead.");
-  launch_cast_bidim_packed<OType>(input, output_rowwise, scales_rowwise, output_colwise,
-                                  scales_colwise, rows, cols, scale_stride_rowwise,
-                                  scale_stride_colwise, stream);
+/*! \brief Entry point: cast, optionally fused with an activation or its gradient and the bias
+ *         gradient. */
+template <typename OType, bool SWIZZLED_SCALES, bool IS_DBIAS = false, bool IS_DACT = false,
+          bool IS_ACT = false, typename ParamOP = Empty,
+          float (*OP)(float, const ParamOP &) = nullptr>
+inline void launch_cast_bidim(const void *input, const void *act_input, void *output_rowwise,
+                              void *scales_rowwise, void *output_colwise, void *scales_colwise,
+                              float *dbias_workspace, int rows, int cols, int scale_stride_rowwise,
+                              int scale_stride_colwise, cudaStream_t stream) {
+  launch_cast_bidim_packed<OType, SWIZZLED_SCALES, IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP>(
+      input, act_input, output_rowwise, scales_rowwise, output_colwise, scales_colwise,
+      dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise, stream);
 }
 
 }  // namespace bidim_detail
+
+constexpr size_t kBidimRows = bidim_detail::kRowsPerTile;
+constexpr size_t kBidimCols = 256;
 
 using bidim_detail::launch_cast_bidim;
 using bidim_detail::launch_cast_bidim_packed;

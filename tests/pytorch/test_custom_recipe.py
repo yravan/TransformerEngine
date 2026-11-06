@@ -42,6 +42,7 @@ from transformer_engine.pytorch.custom_recipes.reference_nvfp4 import (
     nvfp4_ref_rht_2d_factory,
 )
 from transformer_engine.pytorch.custom_recipes.reference_current_scaling import (
+    CurrentScalingQuantizerRef,
     current_scaling_ref_factory,
 )
 
@@ -2056,3 +2057,19 @@ def test_custom_recipe_automatic_padding_bad_splits(qfactory):
     assert out.shape == (sum(original_splits), 128)
     assert torch.isfinite(out).all()
     assert torch.isfinite(inp.grad).all()
+
+
+def test_custom_quantizer_default_copy():
+    """A custom recipe's quantizer need not implement ``copy``: the base class copies it
+    shallowly, so a forward configures the copy's usage while the stored quantizer, and
+    everything the two share, stays as the recipe built it."""
+    quantizer = CurrentScalingQuantizerRef(
+        dtype=torch.float8_e4m3fn, rowwise=True, columnwise=False
+    )
+    clone = quantizer.copy()
+    assert type(clone) is CurrentScalingQuantizerRef
+    assert clone is not quantizer
+    assert clone.__dict__ == quantizer.__dict__
+    clone.set_usage(columnwise=True)
+    assert (quantizer.rowwise_usage, quantizer.columnwise_usage) == (True, False)
+    assert (clone.rowwise_usage, clone.columnwise_usage) == (True, True)
