@@ -1392,6 +1392,18 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             f"{self.__class__.__name__} class does not implement _get_weight_quantizers function"
         )
 
+    def _call_quantizer(self, meta_key: str, index: int) -> Quantizer:
+        """A copy of a stored quantizer for one forward call.
+
+        The forward configures usage and layout for the call it serves on the
+        copy, so the stored quantizer only ever holds recipe state (scale and
+        amax buffers, reduction group). A compiled forward guards on the stored
+        quantizers by value, and that guard holds across every instance sharing
+        the code and across the usage flips between forward and backward only
+        because no call mutates them.
+        """
+        return self.quantizers[meta_key][index].copy()
+
     def _enable_weight_preswizzle(
         self,
         quantizer: Quantizer,

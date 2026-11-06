@@ -60,10 +60,10 @@ class ForwardLinearScaleAdd(FusedOperation):
         weight_requires_grad = linear_op_ctx.requires_grad and linear_op.weight.requires_grad
 
         # Quantizers
-        input_quantizer = linear_op.get_quantizer("forward", 0)
-        weight_quantizer = linear_op.get_quantizer("forward", 1)
+        input_quantizer = linear_op_ctx.input_quantizer
+        weight_quantizer = linear_op_ctx.weight_quantizer
         output_quantizer = None
-        grad_output_quantizer = linear_op.get_quantizer("backward", 0)
+        grad_output_quantizer = linear_op_ctx.grad_output_quantizer
         grad_input_quantizer = prev_op_grad_output_quantizer
         with_quantized_compute = FP8GlobalStateManager.is_fp8_enabled()
         if with_quantized_compute:

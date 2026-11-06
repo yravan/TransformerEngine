@@ -105,6 +105,9 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
 
         # Operation autograd contexts
         basic_op_ctxs = [OperationContext() for _ in range(fuser._num_basic_ops)]
+        for idx, (op, ctx) in enumerate(zip(fuser._basic_ops, basic_op_ctxs)):
+            ctx.requires_grad = idx >= fuser.first_op_requiring_backward
+            op.pre_fuser_forward(ctx)
 
         # Mark input tensors as not deletable in backward. Skipped whenever this
         # is being traced -- not merely when the custom ops are used: these
@@ -134,10 +137,6 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
         ] * fuser._num_basic_ops
         for op, basic_op_idxs in fuser._forward_ops:
 
-            # Set if backward op is required
-            for idx in basic_op_idxs:
-                basic_op_ctxs[idx].requires_grad = idx >= fuser.first_op_requiring_backward
-
             # Resolve internal channel inputs from outputs of
             # earlier basic ops. When a fusion contains both producer and
             # consumer, leave the consumer slot unset so the fused op can
@@ -156,15 +155,13 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
             # Prepare args for op forward
             extra_inputs = [basic_op_extra_inputs[idx] for idx in basic_op_idxs]
             prev_op_idx = basic_op_idxs[0] - 1
-            prev_op = fuser._basic_ops[prev_op_idx] if prev_op_idx >= 0 else None
             prev_op_grad_output_quantizer = None
-            if prev_op is not None:
-                prev_op_grad_output_quantizer = prev_op.get_grad_output_quantizer()
+            if prev_op_idx >= 0:
+                prev_op_grad_output_quantizer = basic_op_ctxs[prev_op_idx].grad_output_quantizer
             next_op_idx = basic_op_idxs[-1] + 1
-            next_op = fuser._basic_ops[next_op_idx] if next_op_idx < fuser._num_basic_ops else None
             next_op_input_quantizer = None
-            if next_op is not None:
-                next_op_input_quantizer = next_op.get_input_quantizer()
+            if next_op_idx < fuser._num_basic_ops:
+                next_op_input_quantizer = basic_op_ctxs[next_op_idx].input_quantizer
 
             compile_kwargs = {"use_custom_ops": True} if use_custom_ops[0] else {}
             x, fused_op_extra_outputs = op.fuser_forward(
@@ -821,7 +818,6 @@ class OperationFuser:
                         "Delayed scaling is not supported under torch.compile in OperationFuser, "
                         "including CustomRecipe with DelayedScalingRequest."
                     )
-            op.pre_fuser_forward(requires_grad=idx >= self.first_op_requiring_backward)
 
         # Fuser forward pass
         # Note: We call forward directly when is_grad_enabled=False,
