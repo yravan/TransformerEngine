@@ -36,10 +36,60 @@ inline bool full_tile_1D_tensor(const Tensor *const t, const size_t elems_per_bl
 namespace kernel {
 
 constexpr size_t THREADS_PER_BLOCK = 256;
+constexpr size_t DBIAS_COL_THREADS = 32;
+constexpr size_t DBIAS_ROW_THREADS = THREADS_PER_BLOCK / DBIAS_COL_THREADS;  // 8
+constexpr size_t DBIAS_MAX_ROW_BLOCKS = 128;
+
+// Stage 1 of the dbias reduction: block (x, y) sums rows [y * rows_per_block, (y + 1) * rows_per_block)
+// of its column slab and writes the sum into the first row of that range, in place. No block reads a
+// row another block writes, so no extra workspace is needed; stage 2 then reads one row per block.
+template <int nvec>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+    reduce_dbias_partial_kernel(float *const dbias_partial, const size_t rows, const size_t cols,
+                                const size_t rows_per_block) {
+  using ComputeVec = Vec<float, nvec>;
+  __shared__ float smem[DBIAS_ROW_THREADS][DBIAS_COL_THREADS * nvec];
+
+  const size_t col = (blockIdx.x * DBIAS_COL_THREADS + threadIdx.x) * nvec;
+  const size_t row_begin = blockIdx.y * rows_per_block;
+  const size_t row_end = min(rows, row_begin + rows_per_block);
+  const bool active = col < cols;
+
+  ComputeVec ldg_vec;
+  ComputeVec acc_vec;
+  acc_vec.clear();
+  if (active) {
+    for (size_t r = row_begin + threadIdx.y; r < row_end; r += DBIAS_ROW_THREADS) {
+      ldg_vec.load_from(dbias_partial + r * cols + col);
+#pragma unroll
+      for (int e = 0; e < nvec; ++e) {
+        acc_vec.data.elt[e] += ldg_vec.data.elt[e];
+      }
+    }
+  }
+#pragma unroll
+  for (int e = 0; e < nvec; ++e) {
+    smem[threadIdx.y][threadIdx.x * nvec + e] = acc_vec.data.elt[e];
+  }
+  __syncthreads();
+  if (threadIdx.y == 0 && active) {
+#pragma unroll
+    for (int e = 0; e < nvec; ++e) {
+      float sum = 0.f;
+#pragma unroll
+      for (int y = 0; y < DBIAS_ROW_THREADS; ++y) {
+        sum += smem[y][threadIdx.x * nvec + e];
+      }
+      acc_vec.data.elt[e] = sum;
+    }
+    acc_vec.store_to(dbias_partial + row_begin * cols + col);
+  }
+}
+
 template <int nvec, typename OType>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
     reduce_dbias_kernel(OType *const dbias_output, const float *const dbias_partial,
-                        const size_t rows, const size_t cols) {
+                        const size_t rows, const size_t cols, const size_t row_stride) {
   using ComputeVec = Vec<float, nvec>;
   using OutputVec = Vec<OType, nvec>;
 
@@ -56,7 +106,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
   ComputeVec acc_vec;
   acc_vec.clear();
   for (int i = 0; i < rows; ++i) {
-    ldg_vec.load_from(thread_in_base + i * cols);
+    ldg_vec.load_from(thread_in_base + i * row_stride * cols);
 #pragma unroll
     for (int e = 0; e < nvec; ++e) {
       acc_vec.data.elt[e] += ldg_vec.data.elt[e];
@@ -131,11 +181,28 @@ void reduce_dbias(const float *workspace_ptr, Tensor *dbias, const size_t rows, 
   constexpr size_t reduce_dbias_nvec = reduce_dbias_store_bytes / sizeof(IType);
 
   NVTE_CHECK(cols % reduce_dbias_nvec == 0, "Unsupported shape.");
-  const size_t reduce_dbias_num_blocks = DIVUP(cols, THREADS_PER_BLOCK * reduce_dbias_nvec);
 
+  // The partial sums are [rows x cols] fp32 with rows = input_rows / 128: a single block looping over
+  // them serially ran on one SM (0.1 ms per call at 900 x 1024). Spread the rows over up to 128 blocks
+  // per column slab first, in place, then finish with the one-block pass over the slab sums.
+  size_t final_rows = rows;
+  size_t row_stride = 1;
+  if (rows > 1) {
+    const size_t row_blocks = min(rows, DBIAS_MAX_ROW_BLOCKS);
+    const size_t rows_per_block = DIVUP(rows, row_blocks);
+    final_rows = DIVUP(rows, rows_per_block);
+    row_stride = rows_per_block;
+    const dim3 block(DBIAS_COL_THREADS, DBIAS_ROW_THREADS);
+    const dim3 grid(DIVUP(cols, DBIAS_COL_THREADS * reduce_dbias_nvec), final_rows);
+    reduce_dbias_partial_kernel<reduce_dbias_nvec>
+        <<<grid, block, 0, stream>>>(const_cast<float *>(workspace_ptr), rows, cols, rows_per_block);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+  }
+
+  const size_t reduce_dbias_num_blocks = DIVUP(cols, THREADS_PER_BLOCK * reduce_dbias_nvec);
   reduce_dbias_kernel<reduce_dbias_nvec, IType>
       <<<reduce_dbias_num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-          reinterpret_cast<IType *>(dbias->data.dptr), workspace_ptr, rows, cols);
+          reinterpret_cast<IType *>(dbias->data.dptr), workspace_ptr, final_rows, cols, row_stride);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 

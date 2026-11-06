@@ -63,6 +63,7 @@ from transformer_engine.pytorch.attention.custom_ops import (
 )
 from transformer_engine.pytorch.jit import no_torch_dynamo
 from transformer_engine.pytorch.dynamo.custom_op import (
+    SymIntLike,
     TensorOrQuantized,
     register_custom_op_with_autograd,
 )
@@ -1577,8 +1578,8 @@ class FusedAttnFwdArgs:
 
     # --- Attention config ---
     is_training: bool
-    max_seqlen_q: int
-    max_seqlen_kv: int
+    max_seqlen_q: SymIntLike
+    max_seqlen_kv: SymIntLike
     attn_scale: float
     dropout_p: float
     fast_zero_fill: bool
@@ -1630,8 +1631,8 @@ class FusedAttnBwdArgs:
     aux_softmax_offset: Optional[torch.Tensor] = None
 
     # --- Attention config ---
-    max_seqlen_q: Optional[int] = None
-    max_seqlen_kv: Optional[int] = None
+    max_seqlen_q: Optional[SymIntLike] = None
+    max_seqlen_kv: Optional[SymIntLike] = None
     attn_scale: Optional[float] = None
     dropout_p: Optional[float] = None
     fast_zero_fill: Optional[bool] = None
