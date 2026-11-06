@@ -87,6 +87,7 @@ dispatcher round trip and no flatten / rebuild of quantized tensors.
 
 from __future__ import annotations
 import dataclasses
+import functools
 import math
 import os
 import types as _types  # aliased: torch_dispatch rules take a ``types`` param
@@ -251,8 +252,10 @@ class OpaqueValueBundle:
         return repr(value)
 
     def __init__(self, data: Optional[Dict[str, Any]] = None) -> None:
-        data = dict(data) if data else {}
-        for k, v in data.items():
+        self._data: Dict[str, Any] = dict(data) if data else {}
+
+    def _validate(self) -> None:
+        for k, v in self._data.items():
             if not OpaqueValueBundle.is_simple_value(v):
                 raise TypeError(
                     f"OpaqueValueBundle field '{k}' has unsupported type "
@@ -260,12 +263,22 @@ class OpaqueValueBundle:
                     "torch.Size, registered value-opaque types and nested "
                     "tuples / lists / dicts thereof are allowed."
                 )
-        self._data: Dict[str, Any] = data
-        self._frozen: Tuple[Tuple[str, Any], ...] = tuple(
-            (k, OpaqueValueBundle._to_hashable(v)) for k, v in sorted(data.items())
-        )
-        # Precomputed: Dynamo guards hash bundles on every compiled call.
-        self._hash: int = hash(self._frozen)
+
+    @functools.cached_property
+    def _key(self) -> Tuple[Tuple[str, Any], ...]:
+        """The contents, validated, in their ordered hashable form.
+
+        Built on the first hash / comparison -- what Dynamo does with a
+        trace-time bundle when it guards on it -- rather than on construction,
+        because inductor's generated code re-evaluates each constant's repr on
+        every call, and a bundle rebuilt there is only ever read.
+        """
+        self._validate()
+        return tuple((k, OpaqueValueBundle._to_hashable(v)) for k, v in sorted(self._data.items()))
+
+    @functools.cached_property
+    def _hash(self) -> int:
+        return hash(self._key)
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
@@ -277,12 +290,13 @@ class OpaqueValueBundle:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, OpaqueValueBundle):
             return NotImplemented
-        return self._frozen == other._frozen
+        return self._key == other._key
 
     def __hash__(self) -> int:
         return self._hash
 
     def __fx_repr__(self) -> Tuple[str, Dict[str, Any]]:
+        self._validate()
         items = ", ".join(
             f"{k!r}: {OpaqueValueBundle._fmt_simple(v)}" for k, v in self._data.items()
         )
@@ -352,8 +366,8 @@ def _storage_flatten(
     The flatten context (embedding the value-opaque quantizer) plus inner names
     and -- for a wrapper subclass -- the outer geometry are stashed in the bundle
     so :func:`_storage_unflatten` can rebuild without PyTorch's ``outer_size``.
-    ``extra_meta`` is merged in before the bundle is built (so its ``_frozen``
-    hash key stays consistent) -- used to tag the tensor-or-quantized slot ``__kind__``.
+    ``extra_meta`` is merged in before the bundle is built (so the bundle's key
+    covers it) -- used to tag the tensor-or-quantized slot ``__kind__``.
     """
     inner_names, ctx = value.__tensor_flatten__()
     meta = dict(ctx)
