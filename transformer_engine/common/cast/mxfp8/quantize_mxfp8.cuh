@@ -716,7 +716,17 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
       use_rowwise_scaling ? reinterpret_cast<e8m0_t *>(output->scale_inv.dptr) : nullptr;
   e8m0_t *const scales_colwise_ptr =
       use_colwise_scaling ? reinterpret_cast<e8m0_t *>(output->columnwise_scale_inv.dptr) : nullptr;
-  const size_t dbias_rows = blocks_Y;
+  constexpr bool COMPUTE_ACTIVATIONS = IS_DACT || IS_ACT;
+  const bool bidimensional_activation_shape =
+      COMPUTE_ACTIVATIONS && use_rowwise_scaling && use_colwise_scaling && !use_2d_quantization &&
+      rows % specialized::kBidimRows == 0 && cols % specialized::kBidimCols == 0;
+  const bool register_resident_activation =
+      bidimensional_activation_shape && input.dtype() == DType::kBFloat16 &&
+      transformer_engine::cuda::sm_arch() >= 100 && is_aligned_ptr(input.data.dptr, 32) &&
+      (!IS_DACT || is_aligned_ptr(act_input->data.dptr, 32));
+  const size_t dbias_rows_capacity =
+      bidimensional_activation_shape ? rows / specialized::kBidimRows : blocks_Y;
+  const size_t dbias_rows = register_resident_activation ? rows / specialized::kBidimRows : blocks_Y;
   const size_t dbias_cols = cols;
 
   ScalingType scaling_type;
@@ -734,7 +744,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
     NVTE_CHECK(workspace != nullptr, "Workspace must be a tensor.");
 
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {dbias_rows, dbias_cols};
+      workspace->data.shape = {dbias_rows_capacity, dbias_cols};
       workspace->data.dtype = DType::kFloat32;
       return;
     }
@@ -812,6 +822,24 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                   (transformer_engine::cuda::sm_arch() >= 100) &&
                   is_aligned_ptr(input.data.dptr, 32);
 
+              if constexpr (COMPUTE_ACTIVATIONS && std::is_same_v<IType, bf16>) {
+                if (register_resident_activation) {
+                  specialized::launch_cast_bidim<OType, WITH_GEMM_SWIZZLED_SCALES, IS_DBIAS, IS_DACT,
+                                                 IS_ACT, ParamOP, OP>(
+                      input.data.dptr, IS_DACT ? act_input->data.dptr : nullptr, output->data.dptr,
+                      reinterpret_cast<void *>(scales_rowwise_ptr), output->columnwise_data.dptr,
+                      reinterpret_cast<void *>(scales_colwise_ptr), workspace_ptr,
+                      static_cast<int>(rows), static_cast<int>(cols),
+                      static_cast<int>(scale_stride_rowwise),
+                      static_cast<int>(scale_stride_colwise), stream);
+                  if constexpr (IS_DBIAS) {
+                    common::reduce_dbias<IType>(workspace_ptr, dbias, dbias_rows, dbias_cols,
+                                                stream);
+                  }
+                  return;
+                }
+              }
+
               // Specialized cast-only kernels do not consume the device noop flag.
               // Preserve cached outputs by keeping noop-aware calls on the generic path.
               if (noop_ptr == nullptr &&
@@ -876,12 +904,13 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                                    "Specialized bidimensional MXFP8 cast cannot emit GEMM-swizzled "
                                    "scales; the colwise direction is unimplemented and a "
                                    "half-swizzled tensor would be unreadable.");
-                        specialized::launch_cast_bidim<OType>(
-                            input.data.dptr, output->data.dptr,
+                        specialized::launch_cast_bidim<OType, false>(
+                            input.data.dptr, nullptr, output->data.dptr,
                             reinterpret_cast<void *>(scales_rowwise_ptr),
                             output->columnwise_data.dptr,
-                            reinterpret_cast<void *>(scales_colwise_ptr), static_cast<int>(rows),
-                            static_cast<int>(cols), static_cast<int>(scale_stride_rowwise),
+                            reinterpret_cast<void *>(scales_colwise_ptr), nullptr,
+                            static_cast<int>(rows), static_cast<int>(cols),
+                            static_cast<int>(scale_stride_rowwise),
                             static_cast<int>(scale_stride_colwise), stream);
                         break;
                       }
