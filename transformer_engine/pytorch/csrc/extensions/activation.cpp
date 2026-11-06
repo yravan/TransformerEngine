@@ -270,6 +270,22 @@ py::object dgeglu(const at::Tensor& grad, const at::Tensor& input, py::handle qu
   return dactivation_helper<nvte_dgeglu, nullptr>(grad, input, quantizer);
 }
 
+py::object gelu_erf(const at::Tensor& input, py::handle quantizer) {
+  return activation_helper<nvte_gelu_erf, nullptr>(input, quantizer);
+}
+
+py::object dgelu_erf(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
+  return dactivation_helper<nvte_dgelu_erf, nullptr>(grad, input, quantizer);
+}
+
+py::object geglu_erf(const at::Tensor& input, py::handle quantizer) {
+  return activation_helper<nvte_geglu_erf, nullptr>(input, quantizer, 2);
+}
+
+py::object dgeglu_erf(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
+  return dactivation_helper<nvte_dgeglu_erf, nullptr>(grad, input, quantizer);
+}
+
 py::object qgelu(const at::Tensor& input, py::handle quantizer) {
   return activation_helper<nvte_qgelu, nullptr>(input, quantizer);
 }

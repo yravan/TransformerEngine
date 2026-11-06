@@ -36,6 +36,21 @@ __device__ inline OType dgelu(const IType val, const Empty&) {
          0.5f * (1.f + tanh_out);
 }
 
+// Exact (erf) GELU, the expression and constants of PyTorch's CUDA GeLU kernels.
+template <typename OType, typename IType>
+__device__ inline OType gelu_erf(const IType val, const Empty&) {
+  const float cval = val;
+  return cval * 0.5f * (1.f + erff(cval * 0.70710678118654752440f));
+}
+
+template <typename OType, typename IType>
+__device__ inline OType dgelu_erf(const IType val, const Empty&) {
+  const float cval = val;
+  const float cdf = 0.5f * (1.f + erff(cval * 0.70710678118654752440f));
+  const float pdf = expf(-0.5f * cval * cval) * 0.39894228040143267794f;
+  return cdf + cval * pdf;
+}
+
 template <typename OType, typename IType>
 __device__ inline OType sigmoid(const IType val, const Empty&) {
   const float cval = val;

@@ -120,6 +120,8 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),
+            "gelu_erf": (tex.gelu_erf, tex.dgelu_erf, None),
+            "geglu_erf": (tex.geglu_erf, tex.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -137,6 +139,8 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, tex.dbias_dgelu),
             "geglu": (tex.geglu, tex.dgeglu, None),
+            "gelu_erf": (tex.gelu_erf, tex.dgelu_erf, tex.dbias_dgelu_erf),
+            "geglu_erf": (tex.geglu_erf, tex.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, tex.dbias_dqgelu),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -160,6 +164,8 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),
+            "gelu_erf": (tex.gelu_erf, tex.dgelu_erf, None),
+            "geglu_erf": (tex.geglu_erf, tex.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -190,7 +196,7 @@ def _act_func(
 
 # Activations whose output halves the last dim (gated linear units).
 _GATED_ACTIVATIONS = frozenset(
-    {"geglu", "glu", "qgeglu", "reglu", "sreglu", "swiglu", "clamped_swiglu"}
+    {"geglu", "geglu_erf", "glu", "qgeglu", "reglu", "sreglu", "swiglu", "clamped_swiglu"}
 )
 
 
@@ -2646,7 +2652,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                    type of normalization applied.
     activation : str, default = 'gelu'
           activation function used.
-          Options: ``'gelu'``, ``'geglu'``, ``'glu'``, ``'qgelu'``, ``'qgeglu'``, ``'relu'``, ``'reglu'``, ``'srelu'``, ``'sreglu'``,
+          Options: ``'gelu'``, ``'geglu'``, ``'gelu_erf'``, ``'geglu_erf'``, ``'glu'``, ``'qgelu'``, ``'qgeglu'``, ``'relu'``, ``'reglu'``, ``'srelu'``, ``'sreglu'``,
           ``'silu'``, ``'swiglu'``, and ``'clamped_swiglu'``.
     activation_params : dict, default = None
                         Additional parameters for the activation function.
@@ -2890,6 +2896,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
         # FC1 init
         if self.activation in [
             "geglu",
+            "geglu_erf",
             "glu",
             "qgeglu",
             "reglu",
@@ -3548,6 +3555,8 @@ class LayerNormMLP(TransformerEngineBaseModule):
         activation_map = {
             "gelu": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
             "geglu": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
+            "gelu_erf": torch.nn.functional.gelu,
+            "geglu_erf": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
             "glu": lambda x: torch.sigmoid(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
             "qgelu": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
             "qgeglu": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0], approximate="tanh")

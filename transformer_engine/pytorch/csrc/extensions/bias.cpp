@@ -269,6 +269,12 @@ std::vector<py::object> dbias_dgelu(const at::Tensor &grad_output, const at::Ten
   return dact_dbias(nvte_quantize_dbias_dgelu, nvte_dgelu, grad_output, act_input, quantizer);
 }
 
+std::vector<py::object> dbias_dgelu_erf(const at::Tensor &grad_output,
+                                        const at::Tensor &act_input, py::handle quantizer) {
+  return dact_dbias(nvte_quantize_dbias_dgelu_erf, nvte_dgelu_erf, grad_output, act_input,
+                    quantizer);
+}
+
 std::vector<py::object> dbias_dsilu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer) {
   return dact_dbias(nvte_quantize_dbias_dsilu, nvte_dsilu, grad_output, act_input, quantizer);

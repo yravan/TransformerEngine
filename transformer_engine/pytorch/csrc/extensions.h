@@ -259,6 +259,14 @@ py::object geglu(const at::Tensor &input, py::handle quantizer);
 
 py::object dgeglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
+py::object gelu_erf(const at::Tensor &input, py::handle quantizer);
+
+py::object dgelu_erf(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
+
+py::object geglu_erf(const at::Tensor &input, py::handle quantizer);
+
+py::object dgeglu_erf(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
+
 py::object qgelu(const at::Tensor &input, py::handle quantizer);
 
 py::object dqgelu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
@@ -451,6 +459,9 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &input, py::handle py_qu
 
 std::vector<py::object> dbias_dgelu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer);
+
+std::vector<py::object> dbias_dgelu_erf(const at::Tensor &grad_output,
+                                        const at::Tensor &act_input, py::handle quantizer);
 
 std::vector<py::object> dbias_dsilu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer);
