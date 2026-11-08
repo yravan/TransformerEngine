@@ -89,6 +89,7 @@ void quantize_gated_fwd_helper(const NVTETensor nvte_input, NVTETensor nvte_outp
       NVTE_CHECK(is_supported_by_CC_100(),
                  "Gated FWD NVTE_MXFP8_1D_SCALING is only supported on SM 10.0+");
       Tensor rowwise_only_tensor;
+      Tensor *full_output = output;
       if (output->has_data() && output->has_columnwise_data()) {
         rowwise_only_tensor = *output;
         rowwise_only_tensor.columnwise_data.clear();
@@ -98,6 +99,11 @@ void quantize_gated_fwd_helper(const NVTETensor nvte_input, NVTETensor nvte_outp
       Tensor dummy_grad_tensor;
       mxfp8::quantize_gated</*IS_BWD=*/false, ParamOP, ActOP, nullptr>(input, dummy_grad_tensor,
                                                                        output, p, stream);
+      if (output == &rowwise_only_tensor) {
+        NVTE_CHECK_CUDA(cudaMemcpyAsync(full_output->columnwise_data.dptr, full_output->data.dptr,
+                                        full_output->data.bytes(), cudaMemcpyDeviceToDevice,
+                                        stream));
+      }
       break;
     }
     default:

@@ -96,6 +96,7 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       Tensor *dummy_dbias_tensor = nullptr;
       Tensor *dummy_workspace_tensor = nullptr;
       Tensor rowwise_only_tensor;
+      Tensor *full_output_tensor = output_tensor;
       if (output_tensor->has_data() && output_tensor->has_columnwise_data()) {
         rowwise_only_tensor = *output_tensor;
         rowwise_only_tensor.columnwise_data.clear();
@@ -114,6 +115,12 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
         mxfp8::quantize</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
             *input_tensor, dummy_input_tensor, noop_tensor, output_tensor, dummy_dbias_tensor,
             dummy_workspace_tensor, quant_config_cpp.mxfp8_2d_quantization, stream);
+      }
+      if (output_tensor == &rowwise_only_tensor) {
+        NVTE_CHECK_CUDA(cudaMemcpyAsync(full_output_tensor->columnwise_data.dptr,
+                                        full_output_tensor->data.dptr,
+                                        full_output_tensor->data.bytes(),
+                                        cudaMemcpyDeviceToDevice, stream));
       }
       break;
     }
