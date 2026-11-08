@@ -31,11 +31,6 @@ void layernorm_fwd(const Tensor& x,      // BxSxhidden_size
       !is_mxfp8_scaling(z->scaling_mode)) {
     NVTE_ERROR("Not implemented scaling mode: " + to_string(z->scaling_mode) + ".");
   }
-  if (is_mxfp8_scaling(z->scaling_mode)) {
-    NVTE_CHECK(!z->with_gemm_swizzled_scales,
-               "MXFP8 output must have scales in compact format, not swizzled for GEMM.");
-  }
-
   NVTE_CHECK(!x.data.shape.empty(), "x must have at least one dimension.");
   const auto [rows, cols] = x.flat_2d_dims();
   NVTE_CHECK(gamma.data.shape == beta.data.shape, "Gamma and Beta must have the same shape.");
@@ -65,6 +60,28 @@ void layernorm_fwd(const Tensor& x,      // BxSxhidden_size
     CheckOutputTensor(*z, "z");
     CheckOutputTensor(*mu, "mu");
     CheckOutputTensor(*rsigma, "rsigma");
+  }
+
+  // MXFP8 output: Transformer Engine's fused kernel, which alone writes GEMM-swizzled scales,
+  // unless cuDNN is requested or the kernel does not support the tensors.
+  if (is_mxfp8_scaling(z->scaling_mode)) {
+    const bool te_supported =
+        is_supported_by_te_layernorm_fwd_mxfp8(x, gamma, beta, *z, *mu, *rsigma);
+    if (z->with_gemm_swizzled_scales || (!use_cudnn_norm_fwd() && te_supported)) {
+      NVTE_CHECK(te_supported,
+                 "LayerNorm forward with GEMM-swizzled MXFP8 scales requires BF16 input and "
+                 "weights, row-wise and column-wise output, rows a multiple of 128 and 768 or "
+                 "1024 columns.");
+      if (workspace->data.numel() == 0) {
+        // The fused kernel needs no workspace, but a zero size denotes a workspace query.
+        workspace->data.shape = {1};
+        workspace->data.dtype = DType::kByte;
+        return;
+      }
+      layernorm_fwd_mxfp8(x, gamma, beta, epsilon, z, mu, rsigma, multiprocessorCount,
+                          zero_centered_gamma, stream);
+      return;
+    }
   }
 
   NVTE_Norm_Backend norm_backend;
@@ -214,6 +231,20 @@ void nvte_layernorm_fwd(const NVTETensor x,      // BxSxhidden_size
                 *convertNVTETensorCheck(beta), epsilon, convertNVTETensor(z), convertNVTETensor(mu),
                 convertNVTETensor(rsigma), convertNVTETensor(workspace), multiprocessorCount,
                 zero_centered_gamma, stream);
+}
+
+bool nvte_layernorm_fwd_mxfp8_fused(const NVTETensor x, const NVTETensor gamma,
+                                    const NVTETensor beta, const NVTETensor z, const NVTETensor mu,
+                                    const NVTETensor rsigma) {
+  NVTE_API_CALL(nvte_layernorm_fwd_mxfp8_fused);
+  using namespace transformer_engine;
+  const Tensor &z_ = *convertNVTETensorCheck(z);
+  return is_mxfp8_scaling(z_.scaling_mode) &&
+         (z_.with_gemm_swizzled_scales || !use_cudnn_norm_fwd()) &&
+         is_supported_by_te_layernorm_fwd_mxfp8(
+             *convertNVTETensorCheck(x), *convertNVTETensorCheck(gamma),
+             *convertNVTETensorCheck(beta), z_, *convertNVTETensorCheck(mu),
+             *convertNVTETensorCheck(rsigma));
 }
 
 void nvte_layernorm_bwd(const NVTETensor dz,      // BxSxhidden_size
