@@ -1500,14 +1500,7 @@ MXFP8Quantizer::MXFP8Quantizer(const py::handle& quantizer) : Quantizer(quantize
 
 static at::Tensor diag_shared_zero_buffer(const std::vector<int64_t>& shape,
                                           const at::TensorOptions& opts) {
-  static std::map<int64_t, at::Tensor> cache;
-  int64_t numel = 1;
-  for (const auto d : shape) numel *= d;
-  auto it = cache.find(numel);
-  if (it == cache.end()) {
-    it = cache.emplace(numel, at::randint(0, 126, {numel}, opts)).first;
-  }
-  return it->second.view(shape);
+  return at::empty(shape, opts);
 }
 
 void MXFP8Quantizer::set_quantization_params(TensorWrapper* tensor) const {}
