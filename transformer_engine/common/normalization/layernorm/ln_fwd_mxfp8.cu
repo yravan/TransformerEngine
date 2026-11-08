@@ -387,7 +387,7 @@ void launch_layernorm_fwd_mxfp8(const Tensor &x, const Tensor &gamma, const Tens
         args, num_tiles, zero_centered_gamma);
   });  // NOLINT(*)
   NVTE_CHECK_CUDA(cudaGetLastError());
-  NVTE_CHECK_CUDA(cudaMemcpyAsync(z->columnwise_data.dptr, z->data.dptr, z->data.bytes(),
+  NVTE_CHECK_CUDA(cudaMemcpyAsync(z->columnwise_data.dptr, z->data.dptr, z->data.buffer_size_bytes(),
                                   cudaMemcpyDeviceToDevice, stream));
 }
 

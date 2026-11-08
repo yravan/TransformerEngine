@@ -101,7 +101,7 @@ void quantize_gated_fwd_helper(const NVTETensor nvte_input, NVTETensor nvte_outp
                                                                        output, p, stream);
       if (output == &rowwise_only_tensor) {
         NVTE_CHECK_CUDA(cudaMemcpyAsync(full_output->columnwise_data.dptr, full_output->data.dptr,
-                                        full_output->data.bytes(), cudaMemcpyDeviceToDevice,
+                                        full_output->data.buffer_size_bytes(), cudaMemcpyDeviceToDevice,
                                         stream));
       }
       break;

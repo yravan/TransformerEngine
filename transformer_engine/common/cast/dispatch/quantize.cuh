@@ -119,7 +119,7 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       if (output_tensor == &rowwise_only_tensor) {
         NVTE_CHECK_CUDA(cudaMemcpyAsync(full_output_tensor->columnwise_data.dptr,
                                         full_output_tensor->data.dptr,
-                                        full_output_tensor->data.bytes(),
+                                        full_output_tensor->data.buffer_size_bytes(),
                                         cudaMemcpyDeviceToDevice, stream));
       }
       break;
