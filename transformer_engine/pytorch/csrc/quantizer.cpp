@@ -4,6 +4,7 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#include <map>
 #include <cuda_runtime_api.h>
 #include <pybind.h>
 
@@ -1497,6 +1498,16 @@ MXFP8Quantizer::MXFP8Quantizer(const py::handle& quantizer) : Quantizer(quantize
   this->with_2d_quantization = quantizer.attr("with_2d_quantization").cast<bool>();
 }
 
+static at::Tensor diag_shared_zero_buffer(const std::vector<int64_t>& shape,
+                                          const at::TensorOptions& opts) {
+  static std::map<std::vector<int64_t>, at::Tensor> cache;
+  auto it = cache.find(shape);
+  if (it == cache.end()) {
+    it = cache.emplace(shape, at::zeros(shape, opts)).first;
+  }
+  return it->second;
+}
+
 void MXFP8Quantizer::set_quantization_params(TensorWrapper* tensor) const {}
 
 std::pair<TensorWrapper, py::object> MXFP8Quantizer::create_tensor(
@@ -1531,8 +1542,7 @@ std::pair<TensorWrapper, py::object> MXFP8Quantizer::create_tensor(
   if (columnwise_usage) {
     const std::vector<int64_t> scale_inv_shape_int64(columnwise_scale_inv_shape.begin(),
                                                      columnwise_scale_inv_shape.end());
-    columnwise_data_tensor =
-        rowwise_usage ? rowwise_data_tensor : at::empty(shape_int64, uint8_tensor_opts);
+    columnwise_data_tensor = diag_shared_zero_buffer(shape_int64, uint8_tensor_opts);
     columnwise_scale_inv_tensor = at::zeros(scale_inv_shape_int64, uint8_tensor_opts);
   }
 
@@ -1790,7 +1800,7 @@ std::pair<TensorWrapper, py::object> MXFP8Quantizer::convert_and_update_tensor(
     if (!columnwise_data) {
       const std::vector<int64_t> shape_int64(shape.begin(), shape.end());
       const auto opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
-      columnwise_data = rowwise_data ? *rowwise_data : at::empty(shape_int64, opts);
+      columnwise_data = diag_shared_zero_buffer(shape_int64, opts);
       tensor.attr("_columnwise_data") = *columnwise_data;
     }
     if (!columnwise_scale_inv) {
