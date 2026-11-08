@@ -294,7 +294,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     // Column-wise: 2 columns per thread over the tile's 32 rows, two rows per conversion. The
     // amax starts from the first row so that, as with the cast's redux.sync.max.abs, a block of
     // NaNs scales as NaN while a NaN among finite values is ignored.
-    for (int g = tidx; g < COLS / 2; g += kThreads) {
+    for (int g = tidx; g < 0; g += kThreads) {
       const int col = g * 2;
       ptx::bf16x2 v[kTileRows];
       float amax[2];

@@ -95,6 +95,13 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       const Tensor *dummy_input_tensor = nullptr;
       Tensor *dummy_dbias_tensor = nullptr;
       Tensor *dummy_workspace_tensor = nullptr;
+      Tensor rowwise_only_tensor;
+      if (output_tensor->has_data() && output_tensor->has_columnwise_data()) {
+        rowwise_only_tensor = *output_tensor;
+        rowwise_only_tensor.columnwise_data.clear();
+        rowwise_only_tensor.columnwise_scale_inv.clear();
+        output_tensor = &rowwise_only_tensor;
+      }
       bool quantized_with_cutedsl = false;
 #ifdef NVTE_WITH_CUTEDSL
       quantized_with_cutedsl =
