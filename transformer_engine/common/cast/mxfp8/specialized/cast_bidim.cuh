@@ -583,28 +583,24 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
 
 namespace {
 
-// Tile shapes.  The wide tile reads 256 bits per lane and suits shallow grids;
-// the narrow tile halves that to get twice the CTAs, which hides latency better
-// once the grid is deep enough to keep every SM busy regardless.
+// Tile shapes.  The wide tile reads 256 bits per lane and amortises the per-row scale work
+// over 512 columns; the narrow tile halves the register footprint, which is what the
+// bias-gradient variant needs: its second input and column sums do not fit the wide tile's
+// 64-register budget without spilling (0.51 vs 0.55 ms at 86016x4096).
 constexpr int32_t kWideColsPerLane = 16;
 constexpr int32_t kNarrowColsPerLane = 8;
-// 4 is the most ptxas accepts at 256 threads per CTA on this target; anything
-// higher is rejected outright and the hint is dropped, with a warning.
+// Four CTAs of 256 threads, i.e. 64 registers; ptxas accepts higher targets, but the extra
+// occupancy they buy was slower than the instructions they cost.
 constexpr int32_t kWideMinBlocksPerSm = 4;
 constexpr int32_t kNarrowMinBlocksPerSm = 4;
 
-// Thread-block cluster widths.  Clustering does not reduce L2 traffic -- L2 is
-// shared by every CTA regardless, and ablating it leaves DRAM bytes and the L2
-// hit rate unchanged.  What it buys is delivery rate, and only because the
-// co-scheduled CTAs read *adjacent* columns of the same rows: permuting the
-// CTA-to-tile map so a cluster's members read distant columns gives the whole
-// gain back.  Which part of the memory system rewards that adjacency is not
-// separable with the available counters.
-constexpr int32_t kWideClusterShallow = 1;
-constexpr int32_t kWideClusterDeep = 4;
-constexpr int32_t kNarrowCluster = 8;
-// Grid size, in CTAs, past which the wide tile switches to the deep cluster.
-constexpr int64_t kWideDeepClusterFrom = 4096;
+// Thread-block cluster widths.  Clustering does not reduce L2 traffic; what it
+// buys is delivery rate when co-scheduled CTAs read adjacent columns of the same
+// rows, and only a cast-only kernel at the memory roofline collects it.  The
+// fused activations are issue-bound and lose 5-8% to any cluster (gelu_erf
+// 0.326 vs 0.342 ms at 86016x4096), so they launch unclustered.
+constexpr int32_t kActivationCluster = 1;
+constexpr int32_t kCastCluster = 4;
 
 /*! \brief Launch quantize_bidim_kernel, specializing on K where we can.
  *
@@ -732,21 +728,20 @@ void launch_cast_bidim_packed(const void *input, const void *act_input, void *ou
   NVTE_CHECK(cols % kNarrowColsPerTile == 0, "Bidimensional MXFP8 requires the column count (",
              cols, ") to be a multiple of ", kNarrowColsPerTile, ".");
 
-  if (cols % kWideColsPerTile == 0) {
-    const int64_t wide_ctas = static_cast<int64_t>(rows / kRowsPerTile) * (cols / kWideColsPerTile);
+  constexpr int32_t kCluster = (IS_ACT || IS_DACT) ? kActivationCluster : kCastCluster;
+  if (cols % kWideColsPerTile == 0 && !IS_DBIAS) {
     launch_tiled<OType, kWideColsPerLane, kWideMinBlocksPerSm, SWIZZLED_SCALES, IS_DBIAS, IS_DACT,
-                 IS_ACT, ParamOP, OP>(
-        input, act_input, output_rowwise, scales_rowwise, output_colwise, scales_colwise,
-        dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise,
-        wide_ctas >= kWideDeepClusterFrom ? kWideClusterDeep : kWideClusterShallow, stream);
+                 IS_ACT, ParamOP, OP>(input, act_input, output_rowwise, scales_rowwise,
+                                      output_colwise, scales_colwise, dbias_workspace, rows, cols,
+                                      scale_stride_rowwise, scale_stride_colwise, kCluster, stream);
     return;
   }
 
-  // Deep grid, or a column count that only the narrow tile divides.
+  // The bias gradient, or a column count that only the narrow tile divides.
   launch_tiled<OType, kNarrowColsPerLane, kNarrowMinBlocksPerSm, SWIZZLED_SCALES, IS_DBIAS,
                IS_DACT, IS_ACT, ParamOP, OP>(
       input, act_input, output_rowwise, scales_rowwise, output_colwise, scales_colwise,
-      dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise, kNarrowCluster, stream);
+      dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise, kCluster, stream);
 }
 
 /*! \brief Entry point: cast, optionally fused with an activation or its gradient and the bias
