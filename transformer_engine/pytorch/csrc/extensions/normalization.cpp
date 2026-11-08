@@ -132,14 +132,18 @@ std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, Maybe
     FUSED_NORM_AMAX_NVFP4
   };
   Impl impl = Impl::UNFUSED;
+  // Transformer Engine's fused LayerNorm + MXFP8 kernel, decided once the output exists
+  bool te_mxfp8_candidate = false;
   if (quantizer.is_none() || IsFloat8Quantizers(quantizer.ptr())) {
     impl = Impl::FULLY_FUSED;
   } else if (IsMXFP8Quantizers(quantizer.ptr())) {
-    const auto layout = normalization_scale_layout_impl(
-        "LayerNorm", *quantizer_cpp, transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN"));
+    const bool use_cudnn = transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN");
+    const auto layout = normalization_scale_layout_impl("LayerNorm", *quantizer_cpp, use_cudnn);
     if (layout && outer_size % layout->first == 0 && inner_size % layout->first == 0) {
       impl = Impl::FULLY_FUSED;
     }
+    te_mxfp8_candidate =
+        !use_cudnn && !static_cast<MXFP8Quantizer *>(quantizer_cpp.get())->with_2d_quantization;
   } else if (detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr()) &&
              !transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN")) {
     auto fp8_quantizer_cpp = dynamic_cast<Float8CurrentScalingQuantizer *>(quantizer_cpp.get());
@@ -172,6 +176,11 @@ std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, Maybe
     std::tie(out_nvte, out) = quantizer_cpp->create_tensor(shape, out_dtype);
   } else {
     out_nvte = makeTransformerEngineTensor(out, quantizer);
+  }
+  if (te_mxfp8_candidate &&
+      nvte_layernorm_fwd_mxfp8_fused(input_nvte.data(), weight_nvte.data(), bias_nvte.data(),
+                                     out_nvte.data(), mu_nvte.data(), rsigma_nvte.data())) {
+    impl = Impl::FULLY_FUSED;
   }
 
   // Construct unquantized output tensor if needed
