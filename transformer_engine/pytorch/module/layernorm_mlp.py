@@ -478,6 +478,13 @@ _CHECKPOINT_SAVED_ALIASES = (
 )
 
 
+def _drop_rowwise_data(tensor: Any) -> None:
+    """The backward only reads a saved GEMM input column-wise (weight gradient), so the
+    row-wise copy of a tensor quantized with both usages is dead weight in the saved context."""
+    if isinstance(tensor, QuantizedTensorStorage) and getattr(tensor, "_columnwise_data", None) is not None:
+        tensor.update_usage(rowwise_usage=False, columnwise_usage=True)
+
+
 def _layernorm_mlp_forward_impl(
     args: LayerNormMLPFwdArgs,
 ) -> Tuple[
@@ -961,6 +968,9 @@ def _layernorm_mlp_forward_impl(
         if not fc2_weight_requires_grad:
             clear_tensor_data(act_out)
             act_out = None
+        if not sequence_parallel and not (return_layernorm_output and with_quantized_norm):
+            _drop_rowwise_data(ln_out)
+        _drop_rowwise_data(act_out)
 
         fsdp_shapes = None
         if not checkpoint:  # regular path, no selective activation checkpointing
@@ -2359,6 +2369,19 @@ def _layernorm_mlp_forward_fake(
             and not ln_out_rebound
             else None
         )
+        # Mirror the impl's ``_drop_rowwise_data`` on the saved activation specs.
+        if (
+            ln_out is not None
+            and ln_out_alias is None
+            and not args.sequence_parallel
+            and ln_out.is_quantized
+            and ln_out.quantizer.columnwise_usage
+        ):
+            ln_out = dataclass_replace(ln_out)
+            ln_out.update_usage(rowwise_usage=False, columnwise_usage=True)
+        if act_out is not None and act_out.is_quantized and act_out.quantizer.columnwise_usage:
+            act_out = dataclass_replace(act_out)
+            act_out.update_usage(rowwise_usage=False, columnwise_usage=True)
         saved_tensor_aliases = (
             "inp" if inputmat_aliases_inp else None,
             "ln_weight" if ln_weight_aliases else None,
