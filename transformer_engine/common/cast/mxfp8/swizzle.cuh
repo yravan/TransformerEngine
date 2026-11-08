@@ -18,6 +18,9 @@ namespace swizzle {
 
 constexpr size_t GEMM_SWIZZLED_SCALE_TILE_DIM_X = 4;
 constexpr size_t GEMM_SWIZZLED_SCALE_TILE_DIM_Y = 128;
+// Distance between the slots of rows i and i + 1 of one tile while both lie in the same 32-row
+// group (see gemm_swizzled_scale_idx below).
+constexpr int32_t kSwizzledRowStride = 16;
 
 /*! \brief Convert compact scale indices into GEMM swizzled scale index
  *

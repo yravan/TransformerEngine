@@ -363,10 +363,17 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
   const uint8_t *tile_in = input + lane_offset * sizeof(bf16);
   uint8_t *out_row = output_rowwise + lane_offset;
   uint8_t *out_col = output_colwise + lane_offset;
-  uint8_t *scale_row = scales_rowwise + static_cast<size_t>(row0) * scale_stride_rowwise +
-                       (col0 / kBlockElems) + (lane / kLanesPerRowBlock);
   // One lane of each cooperating group writes the shared rowwise scale byte.
   const bool owns_row_scale = (lane % kLanesPerRowBlock) == 0;
+  // Where this lane's scale byte for row0 goes, and how far apart the rows are.  In the swizzled
+  // layout the band's 32 rows are the 32 consecutive 16-byte groups of one tile, and a warp's
+  // rows never cross a band, so the index is computed once and the rest is a stride; the 64-bit
+  // swizzle arithmetic otherwise cost more instructions per row than the quantization did.
+  const int32_t row_scale_col = col0 / kBlockElems + lane / kLanesPerRowBlock;
+  uint8_t *const scale_row = SWIZZLED_SCALES
+      ? scales_rowwise + swizzle::gemm_swizzled_scale_idx(row0, row_scale_col, DIVUP(cols, 128))
+      : scales_rowwise + static_cast<size_t>(row0) * scale_stride_rowwise + row_scale_col;
+  const int32_t scale_row_stride = SWIZZLED_SCALES ? swizzle::kSwizzledRowStride : scale_stride_rowwise;
 
   // Read the whole tile into registers; both passes run off these.
   uint32_t tile[kRowsPerWarp][kWordsPerLane];
@@ -397,11 +404,11 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
         }
       }
     }
-    float column_sum[IS_DBIAS ? COLS_PER_LANE : 1];
+    float2 column_sum[IS_DBIAS ? kWordsPerLane : 1];
     if constexpr (IS_DBIAS) {
 #pragma unroll
-      for (int32_t c = 0; c < COLS_PER_LANE; ++c) {
-        column_sum[c] = 0.f;
+      for (int32_t k = 0; k < kWordsPerLane; ++k) {
+        column_sum[k] = make_float2(0.f, 0.f);
       }
     }
 #pragma unroll
@@ -412,16 +419,16 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
         tile[i][k] = activate_word<IS_ACT, IS_DACT, ParamOP, OP>(
             tile[i][k], IS_DACT ? act_tile[i][k] : 0u, value);
         if constexpr (IS_DBIAS) {
-          column_sum[2 * k] += value.x;
-          column_sum[2 * k + 1] += value.y;
+          column_sum[k] = __fadd2_rn(column_sum[k], value);
         }
       }
     }
     if constexpr (IS_DBIAS) {
       __shared__ float s_dbias[kWarpsPerCta][kColsPerTile];
 #pragma unroll
-      for (int32_t c = 0; c < COLS_PER_LANE; ++c) {
-        s_dbias[warp][COLS_PER_LANE * lane + c] = column_sum[c];
+      for (int32_t k = 0; k < kWordsPerLane; ++k) {
+        s_dbias[warp][COLS_PER_LANE * lane + 2 * k] = column_sum[k].x;
+        s_dbias[warp][COLS_PER_LANE * lane + 2 * k + 1] = column_sum[k].y;
       }
       __syncthreads();
       for (int32_t c = tid; c < kColsPerTile; c += kThreadsPerCta) {
@@ -466,16 +473,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
     store_words(out_row + static_cast<size_t>(i) * cols, out_words, policy);
 
     if (owns_row_scale) {
-      if constexpr (SWIZZLED_SCALES) {
-        ptx::st_global_b8(scales_rowwise +
-                              swizzle::gemm_swizzled_scale_idx(
-                                  row0 + i, col0 / kBlockElems + lane / kLanesPerRowBlock,
-                                  DIVUP(cols, 128)),
-                          mx_scale_byte(reciprocal), policy);
-      } else {
-        ptx::st_global_b8(scale_row + static_cast<size_t>(i) * scale_stride_rowwise,
-                          mx_scale_byte(reciprocal), policy);
-      }
+      ptx::st_global_b8(scale_row + i * scale_row_stride, mx_scale_byte(reciprocal), policy);
     }
   }
 
@@ -542,14 +540,17 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_bi
   // Warp 0 emits the colwise scale row: one byte per column, one coalesced
   // vector store per lane.
   if (warp == 0 && SWIZZLED_SCALES) {
+    // The lane's columns are consecutive within one 32-column group, so their swizzled slots
+    // are one stride apart from the first column's.
+    uint8_t *const scale_col = scales_colwise + swizzle::gemm_swizzled_scale_idx(
+                                                    col0 + COLS_PER_LANE * lane, blockIdx.y,
+                                                    DIVUP(rows, 128));
 #pragma unroll
     for (int32_t c = 0; c < COLS_PER_LANE; c += 2) {
       const uint32_t pair_bytes = mx_scale_byte_x2(column_reciprocal[c / 2]);
 #pragma unroll
       for (int32_t h = 0; h < 2; ++h) {
-        ptx::st_global_b8(scales_colwise + swizzle::gemm_swizzled_scale_idx(
-                                               col0 + COLS_PER_LANE * lane + c + h, blockIdx.y,
-                                               DIVUP(rows, 128)),
+        ptx::st_global_b8(scale_col + (c + h) * swizzle::kSwizzledRowStride,
                           (pair_bytes >> (8 * h)) & 0xFFu, policy);
       }
     }
@@ -745,8 +746,7 @@ void launch_cast_bidim_packed(const void *input, const void *act_input, void *ou
   launch_tiled<OType, kNarrowColsPerLane, kNarrowMinBlocksPerSm, SWIZZLED_SCALES, IS_DBIAS,
                IS_DACT, IS_ACT, ParamOP, OP>(
       input, act_input, output_rowwise, scales_rowwise, output_colwise, scales_colwise,
-      dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise, kNarrowCluster,
-      stream);
+      dbias_workspace, rows, cols, scale_stride_rowwise, scale_stride_colwise, kNarrowCluster, stream);
 }
 
 /*! \brief Entry point: cast, optionally fused with an activation or its gradient and the bias
