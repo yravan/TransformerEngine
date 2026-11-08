@@ -89,3 +89,26 @@ def test_dbias_dgelu_erf_register_resident_matches_staged(shape, dtype):
     tolerance = 2e-2 * reference.abs().max()
     torch.testing.assert_close(dbias.float(), reference, rtol=0, atol=tolerance)
     torch.testing.assert_close(dbias.float(), dbias_staged.float(), rtol=0, atol=tolerance)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("dtype", FP8_DTYPES)
+def test_swiglu_register_resident_matches_staged(shape, dtype):
+    torch.manual_seed(0)
+    x = torch.randn((shape[0], 2 * shape[1]), dtype=torch.bfloat16, device="cuda") * 4
+    fused = tex.swiglu(x, quantizer(dtype))
+    staged = tex.swiglu(misaligned(x), quantizer(dtype))
+    assert_same_quantization(fused, staged)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("dtype", FP8_DTYPES)
+def test_dswiglu_register_resident_matches_staged(shape, dtype):
+    torch.manual_seed(0)
+    x = torch.randn((shape[0], 2 * shape[1]), dtype=torch.bfloat16, device="cuda") * 4
+    g = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    fused = tex.dswiglu(g, x, quantizer(dtype))
+    staged = tex.dswiglu(misaligned(g), misaligned(x), quantizer(dtype))
+    assert_same_quantization(fused, staged)
