@@ -124,6 +124,16 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
 
 #pragma unroll
   for (int32_t pl = 0; pl < kPlanes; ++pl) {
+    // A warp's rows lie in one 32-row group, so in the swizzled layout the slot of row i is the
+    // first row's plus a fixed stride: the index arithmetic is done once per plane.
+    const int32_t plane_scale_col = row_scale_col + pl * (cols / kBlockElems);
+    uint8_t *const scale_row =
+        SWIZZLED_SCALES
+            ? scales_rowwise +
+                  swizzle::gemm_swizzled_scale_idx(row0, plane_scale_col, DIVUP(out_cols, 128))
+            : scales_rowwise + static_cast<size_t>(row0) * scale_stride_rowwise + plane_scale_col;
+    const int32_t scale_row_stride =
+        SWIZZLED_SCALES ? swizzle::kSwizzledRowStride : scale_stride_rowwise;
 #pragma unroll
     for (int32_t i = 0; i < kRowsPerWarp; ++i) {
       ptx::bf16x2 amax;
@@ -153,16 +163,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
       store_words(out_row + static_cast<size_t>(i) * out_cols + pl * cols, out_words, policy);
 
       if (owns_row_scale) {
-        const int32_t scale_col = row_scale_col + pl * (cols / kBlockElems);
-        if constexpr (SWIZZLED_SCALES) {
-          ptx::st_global_b8(scales_rowwise + swizzle::gemm_swizzled_scale_idx(
-                                                 row0 + i, scale_col, DIVUP(out_cols, 128)),
-                            mx_scale_byte(reciprocal), policy);
-        } else {
-          ptx::st_global_b8(scales_rowwise + static_cast<size_t>(row0 + i) * scale_stride_rowwise +
-                                scale_col,
-                            mx_scale_byte(reciprocal), policy);
-        }
+        ptx::st_global_b8(scale_row + i * scale_row_stride, mx_scale_byte(reciprocal), policy);
       }
     }
   }
@@ -224,14 +225,16 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
     if (warp == pl) {
       const int32_t plane_col0 = col0 + pl * cols + COLS_PER_LANE * lane;
       if constexpr (SWIZZLED_SCALES) {
+        // The lane's columns are consecutive within one 32-column group: one stride apart.
+        uint8_t *const scale_col =
+            scales_colwise +
+            swizzle::gemm_swizzled_scale_idx(plane_col0, blockIdx.y, DIVUP(rows, 128));
 #pragma unroll
         for (int32_t c = 0; c < COLS_PER_LANE; c += 2) {
           const uint32_t pair_bytes = mx_scale_byte_x2(column_reciprocal[c / 2]);
 #pragma unroll
           for (int32_t h = 0; h < 2; ++h) {
-            ptx::st_global_b8(scales_colwise + swizzle::gemm_swizzled_scale_idx(
-                                                   plane_col0 + c + h, blockIdx.y,
-                                                   DIVUP(rows, 128)),
+            ptx::st_global_b8(scale_col + (c + h) * swizzle::kSwizzledRowStride,
                               (pair_bytes >> (8 * h)) & 0xFFu, policy);
           }
         }
