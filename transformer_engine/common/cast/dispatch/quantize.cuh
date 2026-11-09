@@ -121,6 +121,11 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
                                         full_output_tensor->data.dptr,
                                         full_output_tensor->data.buffer_size_bytes(),
                                         cudaMemcpyDeviceToDevice, stream));
+        NVTE_CHECK_CUDA(cudaMemcpyAsync(
+            full_output_tensor->columnwise_scale_inv.dptr, full_output_tensor->scale_inv.dptr,
+            std::min(full_output_tensor->columnwise_scale_inv.buffer_size_bytes(),
+                     full_output_tensor->scale_inv.buffer_size_bytes()),
+            cudaMemcpyDeviceToDevice, stream));
       }
       break;
     }

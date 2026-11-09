@@ -103,6 +103,11 @@ void quantize_gated_fwd_helper(const NVTETensor nvte_input, NVTETensor nvte_outp
         NVTE_CHECK_CUDA(cudaMemcpyAsync(full_output->columnwise_data.dptr, full_output->data.dptr,
                                         full_output->data.buffer_size_bytes(), cudaMemcpyDeviceToDevice,
                                         stream));
+        NVTE_CHECK_CUDA(cudaMemcpyAsync(
+            full_output->columnwise_scale_inv.dptr, full_output->scale_inv.dptr,
+            std::min(full_output->columnwise_scale_inv.buffer_size_bytes(),
+                     full_output->scale_inv.buffer_size_bytes()),
+            cudaMemcpyDeviceToDevice, stream));
       }
       break;
     }

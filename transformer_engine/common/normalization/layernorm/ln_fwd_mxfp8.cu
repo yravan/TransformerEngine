@@ -389,6 +389,10 @@ void launch_layernorm_fwd_mxfp8(const Tensor &x, const Tensor &gamma, const Tens
   NVTE_CHECK_CUDA(cudaGetLastError());
   NVTE_CHECK_CUDA(cudaMemcpyAsync(z->columnwise_data.dptr, z->data.dptr, z->data.buffer_size_bytes(),
                                   cudaMemcpyDeviceToDevice, stream));
+  NVTE_CHECK_CUDA(cudaMemcpyAsync(
+      z->columnwise_scale_inv.dptr, z->scale_inv.dptr,
+      std::min(z->columnwise_scale_inv.buffer_size_bytes(), z->scale_inv.buffer_size_bytes()),
+      cudaMemcpyDeviceToDevice, stream));
 }
 
 }  // namespace
