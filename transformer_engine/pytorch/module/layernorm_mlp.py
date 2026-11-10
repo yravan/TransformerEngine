@@ -299,6 +299,7 @@ class LayerNormMLPFwdArgs:
 
     # --- Activation checkpointing (recompute in backward) ---
     checkpoint: bool
+    recompute_act_out: bool
     fp8_meta: Optional[Any]
     recompute_for_bwd: bool
 
@@ -470,6 +471,19 @@ _CHECKPOINT_SAVED_ALIASES = (
     "fc2_weight",
     "fc2_bias",
 )
+
+
+def _recomputes_act_out(args: Any, fc1_out: Any) -> bool:
+    """MXFP8 scales depend only on the data, so the backward re-quantizes the activation from the
+    saved ``fc1_out`` bit-exactly instead of keeping its column-wise copy alive from forward to backward."""
+    return (
+        args.fp8
+        and not args.debug
+        and not args.checkpoint
+        and args.recompute_act_out
+        and isinstance(args.fc2_input_quantizer, MXFP8Quantizer)
+        and fc1_out is not None
+    )
 
 
 def _drop_rowwise_data(tensor: Any) -> None:
@@ -965,6 +979,9 @@ def _layernorm_mlp_forward_impl(
         if not sequence_parallel and not (return_layernorm_output and with_quantized_norm):
             _drop_rowwise_data(ln_out)
         _drop_rowwise_data(act_out)
+        if _recomputes_act_out(args, fc1_out):
+            clear_tensor_data(act_out)
+            act_out = None
 
         fsdp_shapes = None
         if not checkpoint:  # regular path, no selective activation checkpointing
@@ -1657,7 +1674,13 @@ def _layernorm_mlp_backward_impl(
             # Note: Synchronize tensor-parallel communication and
             # make sure required data is available
             if args.fp8 or args.debug:
-                if isinstance(act_out, QuantizedTensorStorage):
+                if act_out is None:
+                    args.fc2_input_quantizer.set_usage(rowwise=True, columnwise=True)
+                    act_out = _act_func(args.activation, dbias_fusion=args.recipe_dbias_dact_fusion)[0](
+                        fc1_out, args.fc2_input_quantizer, **(args.activation_params or {})
+                    )
+                    _drop_rowwise_data(act_out)
+                elif isinstance(act_out, QuantizedTensorStorage):
                     act_out.update_usage(columnwise_usage=True)
                 else:
                     args.fc2_input_quantizer.set_usage(rowwise=False, columnwise=True)
@@ -2378,6 +2401,8 @@ def _layernorm_mlp_forward_fake(
         if act_out is not None and act_out.is_quantized and act_out.quantizer.columnwise_usage:
             act_out = dataclass_replace(act_out)
             act_out.update_usage(rowwise_usage=False, columnwise_usage=True)
+        if _recomputes_act_out(args, fc1_out):
+            act_out = None
         saved_tensor_aliases = (
             "inp" if inputmat_aliases_inp else None,
             "ln_weight" if ln_weight_aliases else None,
@@ -2805,6 +2830,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
         delay_wgrad_compute: bool = False,
         symmetric_ar_type: Optional[str] = None,
         checkpoint: bool = False,
+        recompute_act_out: bool = False,
     ) -> None:
         super().__init__(name)
 
@@ -2826,6 +2852,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self.zero_centered_gamma = zero_centered_gamma
         self.symmetric_ar_type = symmetric_ar_type
         self.checkpoint = checkpoint
+        self.recompute_act_out = recompute_act_out
 
         # GEMM-GELU fusion is currently only supported with split GEMM-AG overlap
         self.gemm_gelu_fusion = (
@@ -3359,6 +3386,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 wgrad_store=wgrad_store,
                 # activation checkpointing
                 checkpoint=self.checkpoint,
+                recompute_act_out=self.recompute_act_out,
                 fp8_meta=self.fp8_meta if self.checkpoint else None,
                 recompute_for_bwd=False,
                 # misc
