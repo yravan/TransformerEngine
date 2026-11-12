@@ -47,6 +47,16 @@ __device__ __forceinline__ float2 tanhf_x2(const float2 v) {
   return make_float2(a.x >= small ? e.x : p.x, a.y >= small ? e.y : p.y);
 }
 
+__device__ __forceinline__ float2 sigmoid_x2(const float2 v) {
+  float2 e = __fmul2_rn(v, splat2(-1.4426950f));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.x));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.y));
+  e = __fadd2_rn(e, splat2(1.f));
+  asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(e.x));
+  asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(e.y));
+  return e;
+}
+
 __device__ __forceinline__ float2 gelu_sigmoid_x2(const float2 c, const float2 s) {
   float2 e = __fmul2_rn(c, __ffma2_rn(s, splat2(-0.10294325f), splat2(-2.3022082f)));
   asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.x));
