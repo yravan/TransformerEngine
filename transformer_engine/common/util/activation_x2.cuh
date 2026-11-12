@@ -47,19 +47,26 @@ __device__ __forceinline__ float2 tanhf_x2(const float2 v) {
   return make_float2(a.x >= small ? e.x : p.x, a.y >= small ? e.y : p.y);
 }
 
+__device__ __forceinline__ float2 gelu_sigmoid_x2(const float2 c, const float2 s) {
+  float2 e = __fmul2_rn(c, __ffma2_rn(s, splat2(-0.10294325f), splat2(-2.3022082f)));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.x));
+  asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(e.y));
+  e = __fadd2_rn(e, splat2(1.f));
+  asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(e.x));
+  asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(e.y));
+  return e;
+}
+
 __device__ __forceinline__ float2 gelu_x2(const float2 c) {
-  const float2 u = __ffma2_rn(c, __fmul2_rn(c, splat2(0.03567741f)), splat2(0.79788456f));
-  const float2 t = tanhf_x2(__fmul2_rn(c, u));
-  return __fmul2_rn(c, __ffma2_rn(t, splat2(0.5f), splat2(0.5f)));
+  return __fmul2_rn(c, gelu_sigmoid_x2(c, __fmul2_rn(c, c)));
 }
 
 __device__ __forceinline__ float2 dgelu_x2(const float2 c) {
-  const float2 u = __ffma2_rn(c, __fmul2_rn(c, splat2(0.044715f)), splat2(1.f));
-  const float2 t = tanhf_x2(__fmul2_rn(__fmul2_rn(c, splat2(0.79788456f)), u));
-  const float2 one_m_t2 = __ffma2_rn(make_float2(-t.x, -t.y), t, splat2(1.f));
-  const float2 w = __ffma2_rn(c, __fmul2_rn(c, splat2(0.1070322243f)), splat2(0.79788456f));
-  const float2 l = __fmul2_rn(__fmul2_rn(c, splat2(0.5f)), __fmul2_rn(w, one_m_t2));
-  return __ffma2_rn(__fadd2_rn(t, splat2(1.f)), splat2(0.5f), l);
+  const float2 s = __fmul2_rn(c, c);
+  const float2 sig = gelu_sigmoid_x2(c, s);
+  const float2 w = __fmul2_rn(c, __ffma2_rn(s, splat2(0.21406445f), splat2(1.5957691f)));
+  const float2 q = __fmul2_rn(w, __ffma2_rn(sig, splat2(-1.f), splat2(1.f)));
+  return __ffma2_rn(sig, q, sig);
 }
 
 // erff as libdevice computes it, two lanes at a time.
