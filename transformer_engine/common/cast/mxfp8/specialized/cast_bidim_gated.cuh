@@ -77,7 +77,6 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
                                 policy);
       }
     }
-    const Empty p = {};
 #pragma unroll
     for (int32_t i = 0; i < kRowsPerWarp; ++i) {
 #pragma unroll
@@ -88,27 +87,18 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
         if constexpr (IS_BWD) {
           const float2 d =
               __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 &>(grad_tile[i][k]));
-          float after_act[2];
-          float after_gate[2];
-#pragma unroll
-          for (int32_t e = 0; e < 2; ++e) {
-            const float x = e == 0 ? a.x : a.y;
-            const float gate_elt = e == 0 ? g.x : g.y;
-            const float grad_elt = e == 0 ? d.x : d.y;
-            const float s = sigmoidf(x);
-            const float act_x = x * s;
-            const float dact_x = x * s * (1 - s) + s;
-            after_act[e] = dact_x * grad_elt * gate_elt;
-            after_gate[e] = 1.0f * act_x * grad_elt;
-          }
-          const __nv_bfloat162 ra = __floats2bfloat162_rn(after_act[0], after_act[1]);
-          const __nv_bfloat162 rg = __floats2bfloat162_rn(after_gate[0], after_gate[1]);
+          const float2 sg = sigmoid_x2(a);
+          const float2 act = __fmul2_rn(a, sg);
+          const float2 dact = __ffma2_rn(act, __ffma2_rn(sg, splat2(-1.f), splat2(1.f)), sg);
+          const float2 after_act = __fmul2_rn(__fmul2_rn(dact, d), g);
+          const float2 after_gate = __fmul2_rn(act, d);
+          const __nv_bfloat162 ra = __floats2bfloat162_rn(after_act.x, after_act.y);
+          const __nv_bfloat162 rg = __floats2bfloat162_rn(after_gate.x, after_gate.y);
           tile[0][i][k] = reinterpret_cast<const uint32_t &>(ra);
           tile[1][i][k] = reinterpret_cast<const uint32_t &>(rg);
         } else {
-          const float lo = ActOP(a.x, p) * g.x;
-          const float hi = ActOP(a.y, p) * g.y;
-          const __nv_bfloat162 r = __floats2bfloat162_rn(lo, hi);
+          const float2 act = __fmul2_rn(__fmul2_rn(a, sigmoid_x2(a)), g);
+          const __nv_bfloat162 r = __floats2bfloat162_rn(act.x, act.y);
           tile[0][i][k] = reinterpret_cast<const uint32_t &>(r);
         }
       }
