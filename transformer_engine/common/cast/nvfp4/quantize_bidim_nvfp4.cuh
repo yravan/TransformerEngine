@@ -109,7 +109,7 @@ void quantize_bidim(const Tensor &input, const Tensor *act_input, Tensor *output
 
 namespace carry {
 
-__global__ void carry_amax_kernel(float *__restrict__ history, float *__restrict__ fresh,
+static __global__ void carry_amax_kernel(float *__restrict__ history, float *__restrict__ fresh,
                                   int32_t *__restrict__ step, const float margin,
                                   const int32_t history_len, float *__restrict__ amax_rowwise,
                                   float *__restrict__ amax_columnwise) {
