@@ -828,8 +828,7 @@ inline void quantize_transpose_tuned_1D(const Tensor &input, const Tensor *noop,
                                                              USE_FAST_MATH, RETURN_TRANSPOSE,
                                                              ROW_SCALED_NVFP4>;
 
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     dshmem_size);
+                set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel), dshmem_size);
                 kernel<<<grid, block_size, dshmem_size, stream>>>(
                     tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
                     scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,

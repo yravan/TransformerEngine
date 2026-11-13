@@ -32,10 +32,12 @@ static_assert(NVTE_BUILD_NUM_PHILOX_ROUNDS > 0,
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1180,6 +1182,22 @@ constexpr size_t TMA_SHMEM_ALIGNMENT = 128;  // shared memory address alignment
 
 inline bool is_aligned_ptr(const void *ptr, size_t alignment) {
   return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+}
+
+/*! \brief cudaFuncSetAttribute(MaxDynamicSharedMemorySize) once per (kernel, size).
+ *
+ * The attribute is sticky on the function, so repeating the call on every launch only costs
+ * a runtime API round trip (~2 us) per launch.
+ */
+inline void set_max_dynamic_smem_once(const void *kernel, size_t bytes) {
+  static std::mutex mu;
+  static std::unordered_map<const void *, size_t> done;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = done.find(kernel);
+  if (it != done.end() && it->second >= bytes) return;
+  NVTE_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       static_cast<int>(bytes)));
+  done[kernel] = bytes;
 }
 
 /*! \brief Align a shared-memory base pointer up to `align` bytes.

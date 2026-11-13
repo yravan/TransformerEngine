@@ -1271,7 +1271,7 @@ void row_col_rht_gemm_ntt_w_sfc(
     kEnableRowQuant,
     kUseFastMath>;
 
-  NVTE_CHECK_CUDA(cudaFuncSetAttribute(*kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel_ptr), smem_size);
 
   cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_size, stream};
   cutlass::Status status = cutlass::launch_kernel_on_cluster(

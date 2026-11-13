@@ -33,26 +33,24 @@ __device__ __constant__ float one_device;
 __device__ __constant__ float zero_device;
 
 inline float *GetScalarOne() {
+  static float *dev_ptr = nullptr;
   static std::once_flag init_flag;
   std::call_once(init_flag, []() {
     float one = 1.0f;
     NVTE_CHECK_CUDA(cudaMemcpyToSymbol(one_device, &one, sizeof(float)));
+    NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), one_device));
   });
-  // return address by cudaGetSymbolAddress
-  float *dev_ptr;
-  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), one_device));
   return dev_ptr;
 }
 
 inline float *GetScalarZero() {
+  static float *dev_ptr = nullptr;
   static std::once_flag init_flag;
   std::call_once(init_flag, []() {
     float zero = 0.0f;
     NVTE_CHECK_CUDA(cudaMemcpyToSymbol(zero_device, &zero, sizeof(float)));
+    NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), zero_device));
   });
-  // return address by cudaGetSymbolAddress
-  float *dev_ptr;
-  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), zero_device));
   return dev_ptr;
 }
 

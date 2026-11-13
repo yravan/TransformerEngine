@@ -489,7 +489,7 @@ inline void compute_fused_amax(const Tensor &input, const Tensor *noop, Tensor *
   const dim3 block(FA_THREADS_NUM, 1, 1);
 
   auto kernel = compute_fused_amax_kernel<true, true>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
+  set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel), dshmem_size);
   kernel<<<grid, block, dshmem_size, stream>>>(tensor_map_input, row_amax_ptr, col_amax_ptr,
                                                noop_ptr, rows, cols);
   NVTE_CHECK_CUDA(cudaGetLastError());
@@ -1996,8 +1996,7 @@ void quantize_transpose_impl(const Tensor &input, const Tensor *noop, Tensor *ou
                                                   ScaleType, USE_STOCHASTIC_ROUNDING,
                                                   RETURN_TRANSPOSE, ROW_SCALED_NVFP4,
                                                   RETURN_ROWWISE, /*APPLY_COLUMNWISE_RHT=*/true>;
-              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   dshmem_size);
+              set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel), dshmem_size);
               kernel<<<grid, block_size, dshmem_size, stream>>>(
                   tensor_map_input, tensor_map_output, tensor_map_output_transpose, tensor_map_rht,
                   scales_ptr, scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr,
@@ -2016,8 +2015,7 @@ void quantize_transpose_impl(const Tensor &input, const Tensor *noop, Tensor *ou
                     COMPUTE_ACTIVATIONS, ParamOP, OP, IType, ScaleType, USE_STOCHASTIC_ROUNDING,
                     RETURN_ROWWISE, RETURN_TRANSPOSE, /*WITH_GEMM_SWIZZLED_SCALES=*/false>;
               }
-              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   dshmem_size);
+              set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel), dshmem_size);
               kernel<<<grid, block_size, dshmem_size, stream>>>(
                   tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
                   scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
@@ -2026,8 +2024,7 @@ void quantize_transpose_impl(const Tensor &input, const Tensor *noop, Tensor *ou
               auto kernel = quantize_transpose_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
                                                             ScaleType, USE_STOCHASTIC_ROUNDING,
                                                             RETURN_TRANSPOSE, ROW_SCALED_NVFP4>;
-              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   dshmem_size);
+              set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel), dshmem_size);
               kernel<<<grid, block_size, dshmem_size, stream>>>(
                   tensor_map_input, tensor_map_output, tensor_map_output_transpose, tensor_map_rht,
                   scales_ptr, scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr,

@@ -2026,17 +2026,6 @@ void NVFP4Quantizer::prepare_fused_cast(const TensorWrapper& input, TensorWrappe
   keepalive.push_back(makeTransformerEngineTensor(state.fresh));
   config.set_nvfp4_amax_out(keepalive.back().data());
   config.set_nvfp4_rht_sign_mask(this->rht_matrix_random_sign_mask_t);
-  config.set_stochastic_rounding(this->stochastic_rounding);
-  if (this->stochastic_rounding) {
-    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
-    auto opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-    at::PhiloxCudaState philox_args = init_philox_state(gen, 1024);
-    keepalive_torch.push_back(torch::empty({2}, opts));
-    philox_unpack(philox_args, static_cast<int64_t*>(keepalive_torch.back().data_ptr()));
-    keepalive.push_back(makeTransformerEngineTensor(keepalive_torch.back()));
-    config.set_rng_state(keepalive.back().data());
-  }
 }
 
 void NVFP4Quantizer::set_quantization_params(TensorWrapper* tensor) const {
@@ -2832,11 +2821,9 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     // 1856-wide backbone tensors, which otherwise run the unfused RHT + amax + cast path).
     if ((use_bidim_kernel() || !eligible_for_rht_cast_fusion) &&
         this->fused_cast_eligible(convertShape(input.shape()))) {
-      QuantizationConfigWrapper fused_config;
-      if (noop_flag) fused_config.set_noop_tensor(noop_flag->data());
-      this->prepare_fused_cast(input, out, fused_config, keepalive, keepalive_torch);
+      this->prepare_fused_cast(input, out, quant_config, keepalive, keepalive_torch);
       NVTE_SCOPED_GIL_RELEASE(
-          { nvte_quantize_v2(input.data(), out.data(), fused_config, stream); });
+          { nvte_quantize_v2(input.data(), out.data(), quant_config, stream); });
       return;
     }
     if (eligible_for_rht_cast_fusion) {
