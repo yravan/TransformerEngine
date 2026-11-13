@@ -232,6 +232,25 @@ void nvte_nvfp4_act_bf16(const NVTETensor input, const NVTETensor act_input, NVT
 #undef NVTE_NVFP4_ACT_BWD
 }
 
+void nvte_nvfp4_gated_bf16(const NVTETensor input, const NVTETensor grad, NVTETensor output,
+                           NVTENVFP4FusedAct act, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_gated_bf16);
+  using namespace transformer_engine;
+  const Tensor &in = *convertNVTETensorCheck(input);
+  const Tensor *g = grad != nullptr ? convertNVTETensorCheck(grad) : nullptr;
+  Tensor *out = convertNVTETensorCheck(output);
+  switch (act) {
+    case kNVTENVFP4FusedActSwiGLU:
+      dispatch::nvfp4::gated_bf16<false, Empty, silu<fp32, fp32>, dsilu<fp32, fp32>>(in, g, out, stream);
+      break;
+    case kNVTENVFP4FusedActDSwiGLU:
+      dispatch::nvfp4::gated_bf16<true, Empty, silu<fp32, fp32>, dsilu<fp32, fp32>>(in, g, out, stream);
+      break;
+    default:
+      NVTE_ERROR("Unsupported NVFP4 gated activation (", static_cast<int>(act), ")");
+  }
+}
+
 void nvte_nvfp4_carry_amax(NVTETensor history, NVTETensor fresh, NVTETensor step, float margin,
                            NVTETensor amax_rowwise, NVTETensor amax_columnwise,
                            cudaStream_t stream) {

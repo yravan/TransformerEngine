@@ -80,7 +80,82 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+
+template <bool IS_BWD, typename ParamOP, float (*ActOP)(float, const ParamOP &),
+          float (*DActOP)(float, const ParamOP &)>
+__global__ void __launch_bounds__(kThreads)
+    gated_bf16_kernel(const uint4 *__restrict__ in, const uint4 *__restrict__ grad,
+                      uint4 *__restrict__ out, const int rows, const int cols) {
+  // in: [rows, 2 * cols] (activation half, gate half); fwd out: [rows, cols];
+  // bwd grad: [rows, cols], out: [rows, 2 * cols] (d_activation half, d_gate half).
+  const int cols8 = cols / kVec;
+  const int col8 = blockIdx.x * kThreads + threadIdx.x;
+  if (col8 >= cols8) return;
+  const int row0 = blockIdx.y * kRowsPerCta;
+  const int row_end = min(row0 + kRowsPerCta, rows);
+  const ParamOP p{};
+#pragma unroll 4
+  for (int row = row0; row < row_end; ++row) {
+    const size_t in_idx = static_cast<size_t>(row) * 2 * cols8 + col8;
+    uint4 a = __ldg(in + in_idx);
+    uint4 g = __ldg(in + in_idx + cols8);
+    uint4 d = make_uint4(0u, 0u, 0u, 0u);
+    if constexpr (IS_BWD) d = __ldg(grad + static_cast<size_t>(row) * cols8 + col8);
+    uint32_t *aw = reinterpret_cast<uint32_t *>(&a);
+    uint32_t *gw = reinterpret_cast<uint32_t *>(&g);
+    const uint32_t *dw = reinterpret_cast<const uint32_t *>(&d);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 av = word_to_float2(aw[k]);
+      const float2 gv = word_to_float2(gw[k]);
+      if constexpr (IS_BWD) {
+        const float2 dv = word_to_float2(dw[k]);
+        const float2 da = make_float2(DActOP(av.x, p) * dv.x * gv.x, DActOP(av.y, p) * dv.y * gv.y);
+        const float2 dg = make_float2(ActOP(av.x, p) * dv.x, ActOP(av.y, p) * dv.y);
+        const __nv_bfloat162 ra = __floats2bfloat162_rn(da.x, da.y);
+        const __nv_bfloat162 rg = __floats2bfloat162_rn(dg.x, dg.y);
+        aw[k] = reinterpret_cast<const uint32_t &>(ra);
+        gw[k] = reinterpret_cast<const uint32_t &>(rg);
+      } else {
+        const float2 y = make_float2(ActOP(av.x, p) * gv.x, ActOP(av.y, p) * gv.y);
+        const __nv_bfloat162 r = __floats2bfloat162_rn(y.x, y.y);
+        aw[k] = reinterpret_cast<const uint32_t &>(r);
+      }
+    }
+    if constexpr (IS_BWD) {
+      out[in_idx] = a;
+      out[in_idx + cols8] = g;
+    } else {
+      out[static_cast<size_t>(row) * cols8 + col8] = a;
+    }
+  }
+}
+
 }  // namespace actbf16
+
+template <bool IS_BWD, typename ParamOP, float (*ActOP)(float, const ParamOP &),
+          float (*DActOP)(float, const ParamOP &)>
+void gated_bf16(const Tensor &input, const Tensor *grad, Tensor *output, cudaStream_t stream) {
+  const auto [rows, cols2] = input.flat_2d_dims();
+  const size_t cols = cols2 / 2;
+  NVTE_CHECK(input.dtype() == DType::kBFloat16 && cols2 % 2 == 0 && cols % actbf16::kVec == 0,
+             "gated_bf16 needs a BF16 [N, 2H] input with H a multiple of 8.");
+  NVTE_CHECK(output != nullptr && output->dtype() == DType::kBFloat16, "gated_bf16 output must be BF16.");
+  const auto [orows, ocols] = output->flat_2d_dims();
+  NVTE_CHECK(orows == rows && ocols == (IS_BWD ? cols2 : cols), "gated_bf16 output shape mismatch.");
+  if constexpr (IS_BWD) {
+    NVTE_CHECK(grad != nullptr && grad->dtype() == DType::kBFloat16, "gated_bf16 backward needs a BF16 grad.");
+    const auto [grows, gcols] = grad->flat_2d_dims();
+    NVTE_CHECK(grows == rows && gcols == cols, "gated_bf16 grad shape mismatch.");
+  }
+  const dim3 grid(DIVUP(cols / actbf16::kVec, static_cast<size_t>(actbf16::kThreads)),
+                  DIVUP(rows, static_cast<size_t>(actbf16::kRowsPerCta)));
+  actbf16::gated_bf16_kernel<IS_BWD, ParamOP, ActOP, DActOP><<<grid, actbf16::kThreads, 0, stream>>>(
+      reinterpret_cast<const uint4 *>(input.data.dptr),
+      IS_BWD ? reinterpret_cast<const uint4 *>(grad->data.dptr) : nullptr,
+      reinterpret_cast<uint4 *>(output->data.dptr), static_cast<int>(rows), static_cast<int>(cols));
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
 
 /*! y = act(input) (IS_ACT), y = input * act'(act_input) (IS_DACT) or y = input, in BF16, with the
  *  column sums of y reduced into dbias (IS_DBIAS) through the two-call workspace protocol.

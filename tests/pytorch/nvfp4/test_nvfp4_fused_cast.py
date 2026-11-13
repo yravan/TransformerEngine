@@ -149,3 +149,21 @@ def test_carried_amax_tracks_growth():
     assert dq.abs().amax() <= 2.0 * x.float().abs().amax() * (1 + 1e-6)
     y = fused(big)  # next cast carries the fresh amax of `big`
     assert torch.allclose(y._amax_rowwise, 2.0 * big.float().abs().amax(), rtol=1e-6)
+
+
+@pytest.mark.parametrize("stochastic_rounding", [False, True])
+def test_gated_bandwidth_kernels_match_generic(stochastic_rounding):
+    """swiglu / dswiglu through the NVFP4 path equal the generic kernels followed by the same cast."""
+    torch.manual_seed(0)
+    x = torch.randn(1024, 2 * 1856, dtype=torch.bfloat16, device="cuda")
+    dy = torch.randn(1024, 1856, dtype=torch.bfloat16, device="cuda")
+    q, _ = _quantizers(stochastic_rounding)
+    y = tex.swiglu(x, q)
+    y_ref = q(tex.swiglu(x, None))
+    assert torch.equal(y._rowwise_data, y_ref._rowwise_data)
+    assert torch.equal(y._columnwise_data, y_ref._columnwise_data)
+    q, _ = _quantizers(stochastic_rounding)
+    dx = tex.dswiglu(dy, x, q)
+    dx_ref = q(tex.dswiglu(dy, x, None))
+    assert torch.equal(dx._rowwise_data, dx_ref._rowwise_data)
+    assert torch.equal(dx._columnwise_data, dx_ref._columnwise_data)

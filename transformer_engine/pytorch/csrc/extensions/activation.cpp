@@ -49,7 +49,8 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
+    if (fused_kind != kNVTENVFP4FusedActNone && fused_kind != kNVTENVFP4FusedActSwiGLU &&
+        fused_kind != kNVTENVFP4FusedActDSwiGLU && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
         nvfp4_quantizer_cpp->fused_cast_eligible(output_shape) &&
         input_tensor.scalar_type() == at::kBFloat16) {
       // Single pass: activation, cast and both amaxes in one kernel, with carried global amaxes.
@@ -79,7 +80,9 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
                                    input_tensor.scalar_type() == at::kBFloat16 &&
                                    output_shape.back() % 8 == 0;
         NVTE_SCOPED_GIL_RELEASE({
-          if (bandwidth_act) {
+          if (bandwidth_act && fused_kind == kNVTENVFP4FusedActSwiGLU) {
+            nvte_nvfp4_gated_bf16(input_nvte.data(), nullptr, temp_nvte.data(), fused_kind, stream);
+          } else if (bandwidth_act) {
             nvte_nvfp4_act_bf16(input_nvte.data(), nullptr, temp_nvte.data(), nullptr, nullptr,
                                 fused_kind, stream);
           } else if constexpr (act_func == nullptr) {
@@ -197,7 +200,8 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
+    if (fused_kind != kNVTENVFP4FusedActNone && fused_kind != kNVTENVFP4FusedActSwiGLU &&
+        fused_kind != kNVTENVFP4FusedActDSwiGLU && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
         nvfp4_quantizer_cpp->fused_cast_eligible(input_shape) &&
         input_tensor.scalar_type() == at::kBFloat16) {
       // Single pass: activation, cast and both amaxes in one kernel, with carried global amaxes.
@@ -228,7 +232,10 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
                                    input_tensor.scalar_type() == at::kBFloat16 &&
                                    input_shape.back() % 8 == 0;
         NVTE_SCOPED_GIL_RELEASE({
-          if (bandwidth_act) {
+          if (bandwidth_act && fused_kind == kNVTENVFP4FusedActDSwiGLU) {
+            nvte_nvfp4_gated_bf16(input_nvte.data(), grad_output_nvte.data(), temp_nvte.data(),
+                                  fused_kind, stream);
+          } else if (bandwidth_act) {
             nvte_nvfp4_act_bf16(grad_output_nvte.data(), input_nvte.data(), temp_nvte.data(),
                                 nullptr, nullptr, fused_kind, stream);
           } else if constexpr (dact_func == nullptr) {
@@ -412,11 +419,12 @@ py::object dsilu(const at::Tensor& grad, const at::Tensor& input, py::handle qua
 }
 
 py::object swiglu(const at::Tensor& input, py::handle quantizer) {
-  return activation_helper<nvte_swiglu, nullptr>(input, quantizer, 2);
+  return activation_helper<nvte_swiglu, nullptr, kNVTENVFP4FusedActSwiGLU>(input, quantizer, 2);
 }
 
 py::object dswiglu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
-  return dactivation_helper<nvte_dswiglu, nullptr>(grad, input, quantizer);
+  return dactivation_helper<nvte_dswiglu, nullptr, kNVTENVFP4FusedActDSwiGLU>(grad, input,
+                                                                          quantizer);
 }
 
 py::object situglu(const at::Tensor& input, py::handle quantizer, float beta1, float beta2) {

@@ -528,7 +528,9 @@ enum NVTENVFP4FusedAct {
   kNVTENVFP4FusedActQGelu = 7,
   kNVTENVFP4FusedActDQGelu = 8,
   kNVTENVFP4FusedActRelu = 9,
-  kNVTENVFP4FusedActDRelu = 10
+  kNVTENVFP4FusedActDRelu = 10,
+  kNVTENVFP4FusedActSwiGLU = 11,
+  kNVTENVFP4FusedActDSwiGLU = 12
 };
 
 /*! \brief Single-pass NVFP4 cast (rowwise + RHT'd columnwise) of a BF16 tensor, optionally fused
@@ -574,6 +576,14 @@ void nvte_nvfp4_carry_amax(NVTETensor history, NVTETensor fresh, NVTETensor step
 void nvte_nvfp4_act_bf16(const NVTETensor input, const NVTETensor act_input, NVTETensor output,
                          NVTETensor dbias, NVTETensor workspace, NVTENVFP4FusedAct act,
                          cudaStream_t stream);
+
+/*! \brief BF16 gated activation / its backward at memory bandwidth.
+ *
+ *  kNVTENVFP4FusedActSwiGLU: input [N, 2H] (activation half, then gate half) -> output [N, H].
+ *  kNVTENVFP4FusedActDSwiGLU: grad [N, H], input [N, 2H] -> output [N, 2H].
+ */
+void nvte_nvfp4_gated_bf16(const NVTETensor input, const NVTETensor grad, NVTETensor output,
+                           NVTENVFP4FusedAct act, cudaStream_t stream);
 
 #ifdef __cplusplus
 }  // extern "C"
