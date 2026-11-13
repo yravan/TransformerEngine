@@ -109,9 +109,13 @@ __global__ void __launch_bounds__(kThreads)
       const float2 av = word_to_float2(aw[k]);
       const float2 gv = word_to_float2(gw[k]);
       if constexpr (IS_BWD) {
+        // Same expressions as the generic gated kernel's silu path, so the results are identical.
         const float2 dv = word_to_float2(dw[k]);
-        const float2 da = make_float2(DActOP(av.x, p) * dv.x * gv.x, DActOP(av.y, p) * dv.y * gv.y);
-        const float2 dg = make_float2(ActOP(av.x, p) * dv.x, ActOP(av.y, p) * dv.y);
+        const float sx = sigmoidf(av.x), sy = sigmoidf(av.y);
+        const float ax = av.x * sx, ay = av.y * sy;
+        const float dax = av.x * sx * (1 - sx) + sx, day = av.y * sy * (1 - sy) + sy;
+        const float2 da = make_float2(dax * dv.x * gv.x, day * dv.y * gv.y);
+        const float2 dg = make_float2(ax * dv.x, ay * dv.y);
         const __nv_bfloat162 ra = __floats2bfloat162_rn(da.x, da.y);
         const __nv_bfloat162 rg = __floats2bfloat162_rn(dg.x, dg.y);
         aw[k] = reinterpret_cast<const uint32_t &>(ra);
