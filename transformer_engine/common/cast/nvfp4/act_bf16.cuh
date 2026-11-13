@@ -29,7 +29,7 @@ namespace actbf16 {
 
 constexpr int kThreads = 128;
 constexpr int kVec = 8;  // bf16 per 16-byte vector
-constexpr int kRowsPerCta = 64;
+constexpr int kRowsPerCta = 32;
 
 __device__ __forceinline__ float2 word_to_float2(const uint32_t w) {
   return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xFFFF0000u));
@@ -51,7 +51,7 @@ __global__ void __launch_bounds__(kThreads)
   float2 sum[4];
 #pragma unroll
   for (int k = 0; k < 4; ++k) sum[k] = make_float2(0.f, 0.f);
-#pragma unroll 4
+#pragma unroll 8
   for (int row = row0; row < row_end; ++row) {
     const size_t idx = static_cast<size_t>(row) * cols8 + col8;
     uint4 v = __ldg(in + idx);

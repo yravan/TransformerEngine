@@ -137,7 +137,7 @@ def _get_act_func_supported_list(
         dbias_fusion is True
         or recipe.delayed()
         or recipe.mxfp8()
-        or (recipe.nvfp4() and getattr(recipe, "delayed_amax", False))
+        or recipe.nvfp4()
     ):
         # Delayed scaling, fusion supported list: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
         # MXFP8: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
@@ -3263,7 +3263,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                     wgrad_use_split_accumulator = _recipe.fp8_gemm_wgrad.use_split_accumulator
                 recipe_float8_block_scaling = _recipe.float8_block_scaling()
                 recipe_custom = _recipe.custom()
-                recipe_dbias_dact_fusion = _recipe.delayed() or _recipe.mxfp8()
+                recipe_dbias_dact_fusion = _recipe.delayed() or _recipe.mxfp8() or _recipe.nvfp4()
             else:
                 backward_override = None
 
