@@ -1391,6 +1391,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
   const size_t warp_id = threadIdx.x / 32;
   const size_t lane_id = threadIdx.x % 32;
   float thread_amax = 0.0f;
+  float tensor_amax = 0.0f;
   const size_t block_in_warp = lane_id / BLOCKS_PER_WARP;
 
 // Initialize shared memory barrier with the number of threads participating in the barrier.
@@ -1504,6 +1505,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
       }
       // Warp reduction to get block amax
       block_amax = warp_reduce_amax(thread_amax, block_in_warp);
+      tensor_amax = fmaxf(tensor_amax, block_amax);
 
       if (lane_id == 0 || lane_id == 16) {
         block_amax_matrix[block_in_tile_y][block_in_tile_x] = block_amax;
@@ -1788,7 +1790,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   // Fresh global amax for the next carried cast: one atomic per warp.
   if (amax_out != nullptr) {
-    float warp_amax = thread_amax;
+    float warp_amax = tensor_amax;
 #pragma unroll
     for (int d = 16; d > 0; d >>= 1) {
       warp_amax = fmaxf(warp_amax, __shfl_xor_sync(0xFFFFFFFFu, warp_amax, d));
