@@ -8,6 +8,8 @@
 #define TRANSFORMER_ENGINE_PYTORCH_CSRC_COMMON_H_
 
 #include <ATen/ATen.h>
+
+#include <functional>
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
@@ -391,6 +393,13 @@ class NVFP4Quantizer : public Quantizer {
                           QuantizationConfigWrapper& config,
                           std::vector<TensorWrapper>& keepalive,
                           std::vector<at::Tensor>& keepalive_torch);
+
+  /*! @brief Carried global amax for any NVFP4 cast whose kernel records the fresh amax: the
+   *  output's amaxes come from `measure` (exact) on the first call and from the amax history
+   *  afterwards; the config gets the amax-out tensor the cast kernel accumulates into. */
+  void prepare_carried_amax(TensorWrapper& out, QuantizationConfigWrapper& config,
+                            std::vector<TensorWrapper>& keepalive,
+                            const std::function<void()>& measure);
 
   NVTEScalingMode get_scaling_mode() const override { return NVTE_NVFP4_1D_SCALING; }
 

@@ -1996,19 +1996,15 @@ bool NVFP4Quantizer::fused_cast_eligible(const std::vector<size_t>& shape) const
   return rows % 64 == 0 && cols % 64 == 0 && cols > 0;
 }
 
-void NVFP4Quantizer::prepare_fused_cast(const TensorWrapper& input, TensorWrapper& out,
-                                        QuantizationConfigWrapper& config,
-                                        std::vector<TensorWrapper>& keepalive,
-                                        std::vector<at::Tensor>& keepalive_torch) {
+void NVFP4Quantizer::prepare_carried_amax(TensorWrapper& out, QuantizationConfigWrapper& config,
+                                          std::vector<TensorWrapper>& keepalive,
+                                          const std::function<void()>& measure) {
   auto stream = at::cuda::getCurrentCUDAStream();
   NVTE_CHECK(out.get_amax().data_ptr != nullptr && out.get_columnwise_amax().data_ptr != nullptr,
-             "NVFP4 fused cast needs the output's amax buffers.");
+             "NVFP4 carried amax needs the output's amax buffers.");
   NVFP4AmaxState& state = nvfp4_amax_state(this->amax_state_id);
   if (!state.warm) {
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_hadamard_transform_amax(input.data(), out.data(), 0,
-                                   this->rht_matrix_random_sign_mask_t, stream);
-    });
+    measure();
     state.warm = true;
   } else {
     auto history = makeTransformerEngineTensor(state.history);
@@ -2025,6 +2021,19 @@ void NVFP4Quantizer::prepare_fused_cast(const TensorWrapper& input, TensorWrappe
   }
   keepalive.push_back(makeTransformerEngineTensor(state.fresh));
   config.set_nvfp4_amax_out(keepalive.back().data());
+}
+
+void NVFP4Quantizer::prepare_fused_cast(const TensorWrapper& input, TensorWrapper& out,
+                                        QuantizationConfigWrapper& config,
+                                        std::vector<TensorWrapper>& keepalive,
+                                        std::vector<at::Tensor>& keepalive_torch) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  this->prepare_carried_amax(out, config, keepalive, [&]() {
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_hadamard_transform_amax(input.data(), out.data(), 0,
+                                   this->rht_matrix_random_sign_mask_t, stream);
+    });
+  });
   config.set_nvfp4_rht_sign_mask(this->rht_matrix_random_sign_mask_t);
 }
 
@@ -2873,26 +2882,41 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     }
   } else {  // Without RHT
     if (compute_amax && !row_scaled_nvfp4 && !this->disable_second_level_scale) {
-      // Amax pointers
-      auto rowwise_amax_ptr = out.get_amax().data_ptr;
-      auto columnwise_amax_ptr = out.get_columnwise_amax().data_ptr;
-      void* amax_ptr = rowwise_amax_ptr != nullptr ? rowwise_amax_ptr : columnwise_amax_ptr;
-      NVTE_CHECK(amax_ptr != nullptr, "Could not find amax pointer");
+      auto measure_amax = [&]() {
+        // Amax pointers
+        auto rowwise_amax_ptr = out.get_amax().data_ptr;
+        auto columnwise_amax_ptr = out.get_columnwise_amax().data_ptr;
+        void* amax_ptr = rowwise_amax_ptr != nullptr ? rowwise_amax_ptr : columnwise_amax_ptr;
+        NVTE_CHECK(amax_ptr != nullptr, "Could not find amax pointer");
 
-      // Compute amax of input tensor
-      out.set_amax(amax_ptr, DType::kFloat32, std::vector<size_t>{1});
-      NVTE_SCOPED_GIL_RELEASE(
-          { nvte_compute_amax_with_config(input.data(), out.data(), quant_config, stream); });
-      out.set_amax(rowwise_amax_ptr, DType::kFloat32, std::vector<size_t>{1});
+        // Compute amax of input tensor
+        out.set_amax(amax_ptr, DType::kFloat32, std::vector<size_t>{1});
+        NVTE_SCOPED_GIL_RELEASE(
+            { nvte_compute_amax_with_config(input.data(), out.data(), quant_config, stream); });
+        out.set_amax(rowwise_amax_ptr, DType::kFloat32, std::vector<size_t>{1});
 
-      // Make sure row-wise and column-wise amaxes match
-      if (rowwise_amax_ptr != amax_ptr && rowwise_amax_ptr != nullptr) {
-        NVTE_CHECK_CUDA(cudaMemcpyAsync(rowwise_amax_ptr, amax_ptr, sizeof(float),
-                                        cudaMemcpyDeviceToDevice, stream));
-      }
-      if (columnwise_amax_ptr != amax_ptr && columnwise_amax_ptr != nullptr) {
-        NVTE_CHECK_CUDA(cudaMemcpyAsync(columnwise_amax_ptr, amax_ptr, sizeof(float),
-                                        cudaMemcpyDeviceToDevice, stream));
+        // Make sure row-wise and column-wise amaxes match
+        if (rowwise_amax_ptr != amax_ptr && rowwise_amax_ptr != nullptr) {
+          NVTE_CHECK_CUDA(cudaMemcpyAsync(rowwise_amax_ptr, amax_ptr, sizeof(float),
+                                          cudaMemcpyDeviceToDevice, stream));
+        }
+        if (columnwise_amax_ptr != amax_ptr && columnwise_amax_ptr != nullptr) {
+          NVTE_CHECK_CUDA(cudaMemcpyAsync(columnwise_amax_ptr, amax_ptr, sizeof(float),
+                                          cudaMemcpyDeviceToDevice, stream));
+        }
+      };
+      // The 2D (weight) kernel records the fresh amax, so these casts carry it like the RHT ones:
+      // the separate zero + amax launches run only on the first call.
+      const bool carried_weight = this->delayed_amax && this->with_2d_quantization &&
+                                  input.dtype() == DType::kBFloat16 && this->rowwise_usage &&
+                                  this->columnwise_usage && !this->with_amax_reduction &&
+                                  this->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled &&
+                                  out.get_amax().data_ptr != nullptr &&
+                                  out.get_columnwise_amax().data_ptr != nullptr;
+      if (carried_weight) {
+        this->prepare_carried_amax(out, quant_config, keepalive, measure_amax);
+      } else {
+        measure_amax();
       }
     }
   }

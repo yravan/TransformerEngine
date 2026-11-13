@@ -1272,7 +1272,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                        const float *noop, const float *const amax_rowwise_ptr,
                                        const float *const amax_colwise_ptr, const size_t rows,
                                        const size_t cols, const size_t scale_stride,
-                                       const size_t scale_stride_t, const size_t *rng_state) {
+                                       const size_t scale_stride_t, const size_t *rng_state,
+                                       float *const amax_out) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -1785,6 +1786,19 @@ __global__ void __launch_bounds__(THREADS_NUM)
     }
   }  // end of stages
 
+  // Fresh global amax for the next carried cast: one atomic per warp.
+  if (amax_out != nullptr) {
+    float warp_amax = thread_amax;
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+      warp_amax = fmaxf(warp_amax, __shfl_xor_sync(0xFFFFFFFFu, warp_amax, d));
+    }
+    if (lane_id == 0) {
+      atomicMaxFloat(amax_out, warp_amax);
+      atomicMaxFloat(amax_out + 1, warp_amax);
+    }
+  }
+
   // Vectorized store scaling factors through SHMEM
   if (RETURN_TRANSPOSE && colwise_scale_is_within_bounds_Y) {
     const size_t scale_idx_sh = tid_Y_t * SCALES_PER_CHUNK_Y;
@@ -1938,6 +1952,13 @@ void quantize_transpose_impl(const Tensor &input, const Tensor *noop, Tensor *ou
                "Shape of the RNG state should be [2], but got ", rng_state_te_tensor.data.shape);
     rng_state = reinterpret_cast<const size_t *>(rng_state_te_tensor.data.dptr);
   }
+  float *amax_out = nullptr;
+  if (quant_config != nullptr && quant_config->nvfp4_amax_out != nullptr) {
+    const Tensor &amax_out_tensor = *convertNVTETensorCheck(quant_config->nvfp4_amax_out);
+    NVTE_CHECK(amax_out_tensor.data.dtype == DType::kFloat32 && amax_out_tensor.data.numel() >= 2,
+               "NVFP4 amax-out tensor must hold 2 floats.");
+    amax_out = reinterpret_cast<float *>(amax_out_tensor.data.dptr);
+  }
 
   using IType = bf16;
 
@@ -2019,7 +2040,7 @@ void quantize_transpose_impl(const Tensor &input, const Tensor *noop, Tensor *ou
               kernel<<<grid, block_size, dshmem_size, stream>>>(
                   tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
                   scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
-                  scale_stride, scale_stride_transpose, rng_state);
+                  scale_stride, scale_stride_transpose, rng_state, amax_out);
             } else {
               auto kernel = quantize_transpose_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
                                                             ScaleType, USE_STOCHASTIC_ROUNDING,

@@ -167,3 +167,26 @@ def test_gated_bandwidth_kernels_match_generic():
     dx_ref = q(tex.dswiglu(dy, x, None))
     assert torch.equal(dx._rowwise_data, dx_ref._rowwise_data)
     assert torch.equal(dx._columnwise_data, dx_ref._columnwise_data)
+
+
+def test_weight_cast_carries_amax():
+    """The 2D (weight) cast records its fresh amax too: exact on the first call, carried after."""
+    torch.manual_seed(0)
+    tex.nvfp4_reset_amax_states()
+    kwargs = dict(with_rht=False, with_2d_quantization=True, stochastic_rounding=False)
+    ref = NVFP4Quantizer(**kwargs)
+    carried = NVFP4Quantizer(**kwargs, delayed_amax=True, amax_margin=2.0)
+    w = torch.randn(2048, 1024, dtype=torch.bfloat16, device="cuda")
+    y_ref = ref(w)
+    y = carried(w)
+    assert torch.equal(y._rowwise_data, y_ref._rowwise_data)
+    assert torch.equal(y._columnwise_data, y_ref._columnwise_data)
+    assert torch.allclose(y._amax_rowwise, w.float().abs().amax())
+    y = carried(w)
+    assert torch.allclose(y._amax_rowwise, 2.0 * w.float().abs().amax(), rtol=1e-6)
+    assert torch.allclose(y._amax_columnwise, 2.0 * w.float().abs().amax(), rtol=1e-6)
+    assert torch.allclose(_dq(y), _dq(y_ref), atol=_block_step(_dq(y_ref)).amax().item(), rtol=0)
+    big = w * 8
+    carried(big)
+    y = carried(big)
+    assert torch.allclose(y._amax_rowwise, 2.0 * big.float().abs().amax(), rtol=1e-6)
