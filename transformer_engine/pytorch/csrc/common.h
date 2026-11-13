@@ -394,6 +394,15 @@ class NVFP4Quantizer : public Quantizer {
                           std::vector<TensorWrapper>& keepalive,
                           std::vector<at::Tensor>& keepalive_torch);
 
+  /*! @brief Whether the RHT cast fusion can apply a forward activation to a tensor of this shape
+   *  (carried amax already warm, both layouts, the CUTLASS kernel's shape rules). */
+  bool rht_fused_act_eligible(const std::vector<size_t>& shape) const;
+
+  /*! @brief Activation + RHT cast + both amaxes in the one CUTLASS kernel (see rht_fused_act_eligible) */
+  void quantize_fused_act(const TensorWrapper& input, TensorWrapper& out, int32_t fused_act);
+
+  int32_t pending_fused_act = 0;
+
   /*! @brief Carried global amax for any NVFP4 cast whose kernel records the fresh amax: the
    *  output's amaxes come from `measure` (exact) on the first call and from the amax history
    *  afterwards; the config gets the amax-out tensor the cast kernel accumulates into. */

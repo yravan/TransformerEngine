@@ -446,6 +446,9 @@ enum NVTEQuantizationConfigAttribute {
   /*! Stochastic rounding seed and offset passed by value (2 x uint64) instead of through the
    *  RNG state tensor; honoured by the NVFP4 fused single-pass cast kernels. */
   kNVTEQuantizationConfigRNGSeedOffset = 13,
+  /*! Activation (NVTENVFP4FusedAct, as int32) applied inside the NVFP4 RHT cast fusion
+   *  kernel before quantizing; the output's global amaxes must already be the carried ones. */
+  kNVTEQuantizationConfigNVFP4FusedAct = 14,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1506,6 +1509,12 @@ class QuantizationConfigWrapper {
   void set_rng_state(NVTETensor rng_state) {
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigRNGState, &rng_state,
                                            sizeof(NVTETensor));
+  }
+
+  /*! \brief Set the activation fused into the NVFP4 RHT cast (NVTENVFP4FusedAct as int) */
+  void set_nvfp4_fused_act(int32_t act) {
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigNVFP4FusedAct, &act,
+                                           sizeof(int32_t));
   }
 
   /*! \brief Set the stochastic rounding seed and offset by value */

@@ -19,6 +19,7 @@
 #include "common/cast/nvfp4/core_nvfp4.cuh"
 #include "common/cast/nvfp4/quantize_transpose_nvfp4.cuh"
 #include "common/common.h"
+#include "common/util/math.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/curanddx.hpp"
 #include "common/util/ptx.cuh"
@@ -142,6 +143,8 @@ struct SharedStorage {
   alignas(16) AccumulatorPipelineStorage accumulator;
   alignas(16) MainloopPipelineStorage mainloop;
   alignas(16) cute::uint64_t tma_barrier[1];
+  // Per mainloop stage: the row-quant warps have applied the fused activation in smem.
+  alignas(16) cute::uint64_t xform_barrier[MainloopPipelineStageCount];
   alignas(16) CLCPipelineStorage clc;
   alignas(16) CLCThrottlePipelineStorage clc_throttle;
   alignas(16) CLCResponse clc_response[SchedulerPipelineStageCount_];
@@ -161,7 +164,8 @@ template <class MShape, class NShape, class KShape, class ClusterShape, class Cl
           bool kEnableStochasticRounding_ = false,
           bool kEnableRHTColQuant_ = true,
           bool kEnableRowQuant_ = true,
-          bool kUseFastMath_ = true>
+          bool kUseFastMath_ = true,
+          int kActKind_ = 0>
 __launch_bounds__(640, 1)
 __global__ static void row_col_rht_gemm_device(
     MShape M,
@@ -224,6 +228,10 @@ __global__ static void row_col_rht_gemm_device(
   static constexpr bool kEnableRHTColQuant = kEnableRHTColQuant_;
   static constexpr bool kEnableRowQuant = kEnableRowQuant_;
   static constexpr bool kUseFastMath = kUseFastMath_;
+  // 0: none, 1: tanh GELU, 2: erf GELU, applied to the A tile in smem by the row-quant warps.
+  static constexpr int kActKind = kActKind_;
+  static_assert(kActKind == 0 || (kEnableRowQuant_ && kEnableRHTColQuant_),
+                "The fused activation needs both the row-quant warps and the RHT MMA.");
   static int constexpr RhtTensorSize = 16;
   static int constexpr kTmaRhtTensorTransactionBytes = cutlass::bits_to_bytes(
       RhtTensorSize * RhtTensorSize * cute::sizeof_bits_v<TB>);
@@ -502,6 +510,12 @@ __global__ static void row_col_rht_gemm_device(
 
   if (warp_idx == 2 && elect_one_sync()) {
     cute::initialize_barrier(shared_storage.tma_barrier[0], /* num_threads */ 1);
+    if constexpr (kActKind != 0) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < SharedStorage::MainloopPipelineStageCount; ++s) {
+        cute::initialize_barrier(shared_storage.xform_barrier[s], NumEpilogueRowQuantThreadCount);
+      }
+    }
     // Publish this separately initialized barrier before TMA can complete against it.
     cutlass::arch::fence_barrier_init();
   }
@@ -617,6 +631,9 @@ __global__ static void row_col_rht_gemm_device(
         for (int k_tile = 0; k_tile < K_TILE_MAX && k_tile + scheduler.tile_n_base() < scheduler.tiles_n(); ) {
           mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state, barrier_token);
           int read_stage = mainloop_pipe_consumer_state.index();
+          if constexpr (kActKind != 0) {
+            cute::wait_barrier(shared_storage.xform_barrier[read_stage], mainloop_pipe_consumer_state.phase());
+          }
           auto tCrA_mk = tCrA(_,_,_,read_stage);
           auto tCrB_nk = tCrB(_,_,0,0);
           CUTLASS_PRAGMA_UNROLL
@@ -992,6 +1009,20 @@ __global__ static void row_col_rht_gemm_device(
           mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state, barrier_token);
           copy(tiled_s2r, tQAsA(_, _, _, mainloop_pipe_consumer_state.index()), tQArA);
           cutlass::arch::fence_view_async_shared();
+          if constexpr (kActKind != 0) {
+            // Activation in registers (feeds the rowwise quant below), written back to smem for the RHT MMA.
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tQArA); ++i) {
+              float f = static_cast<float>(tQArA(i));
+              f = (kActKind == 2) ? transformer_engine::gelu_erf<float, float>(f, transformer_engine::Empty{})
+                                  : transformer_engine::gelu<float, float>(f, transformer_engine::Empty{});
+              tQArA(i) = static_cast<TA>(f);
+            }
+            copy(tiled_s2r, tQArA, tQAsA(_, _, _, mainloop_pipe_consumer_state.index()));
+            cutlass::arch::fence_view_async_shared();
+            cutlass::arch::ClusterBarrier::arrive(
+                cute::cast_smem_ptr_to_uint(&shared_storage.xform_barrier[mainloop_pipe_consumer_state.index()]));
+          }
           auto curr_mainloop_pipe_consumer_state = mainloop_pipe_consumer_state;
           ++mainloop_pipe_consumer_state;
           ++k_tile;
@@ -1086,7 +1117,7 @@ __global__ static void row_col_rht_gemm_device(
 // QA: m x n: col-major
 // SFA: m/16 x n: col-major
 template <bool kEnableStochasticRounding, bool kEnableRHTColQuant, bool kEnableRowQuant, bool kEnableSwizzleSFOutput,
-class TA, class TB, class TD, class TSFD, class TQA, class TSFA, bool kUseFastMath=true>
+class TA, class TB, class TD, class TSFD, class TQA, class TSFA, bool kUseFastMath=true, int kActKind=0>
 void row_col_rht_gemm_ntt_w_sfc(
     int sequence_length,
     int hidden_size,
@@ -1273,7 +1304,8 @@ void row_col_rht_gemm_ntt_w_sfc(
     kEnableStochasticRounding,
     kEnableRHTColQuant,
     kEnableRowQuant,
-    kUseFastMath>;
+    kUseFastMath,
+    kActKind>;
 
   set_max_dynamic_smem_once(reinterpret_cast<const void *>(kernel_ptr), smem_size);
 
@@ -1424,6 +1456,11 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
   // GEMM consumes, eliminating the otherwise-required
   // nvte_swizzle_scaling_factors pass between quantize and GEMM.
   const bool use_swizzle_sf_output = output_.with_gemm_swizzled_scales;
+  const int act_kind = quant_config.nvfp4_fused_act;
+  NVTE_CHECK(act_kind == 0 || act_kind == kNVTENVFP4FusedActGelu || act_kind == kNVTENVFP4FusedActGeluErf,
+             "Unsupported activation for the NVFP4 RHT cast fusion: ", act_kind);
+  NVTE_CHECK(act_kind == 0 || (has_rowwise_quant && has_columnwise_quant),
+             "The fused activation needs rowwise and columnwise NVFP4 outputs.");
 
   TRANSFORMER_ENGINE_NVFP4_SCALE_TYPE_SWITCH(
       scale_dtype, ScaleType,
@@ -1438,6 +1475,34 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
                       TRANSFORMER_ENGINE_SWITCH_CONDITION(
                           quant_config.use_fast_math, kUseFastMath,
 
+                          if constexpr (kEnableRhtColQuant && kEnableRowQuant) {
+                            if (act_kind != 0) {
+                              auto launch_act = [&](auto act_tag) {
+                                detail::row_col_rht_gemm_ntt_w_sfc<
+                                    kEnableStochasticRounding, true, true, kEnableSwizzleSFOutput,
+                                    TA, TB, TD, ScaleType, TQA, ScaleType, kUseFastMath,
+                                    decltype(act_tag)::value>(
+                                    m, n, reinterpret_cast<TA const *>(input.dptr),
+                                    reinterpret_cast<TB const *>(hadamard_matrix.dptr),
+                                    reinterpret_cast<TD *>(columnwise_data_ptr),
+                                    reinterpret_cast<ScaleType *>(columnwise_scale_inv_ptr),
+                                    reinterpret_cast<TQA *>(rowwise_data_ptr),
+                                    reinterpret_cast<ScaleType *>(rowwise_scale_inv_ptr),
+                                    reinterpret_cast<float const *>(rowwise_amax_ptr),
+                                    reinterpret_cast<float const *>(columnwise_amax_ptr), amax_out,
+                                    amax_out ? amax_out + 1 : nullptr, rng_state,
+                                    quant_config.rng_by_value ? quant_config.rng_seed_offset[0] : 0,
+                                    quant_config.rng_by_value ? quant_config.rng_seed_offset[1] : 0,
+                                    sm_count, stream, k_tile_size);
+                              };
+                              if (act_kind == kNVTENVFP4FusedActGeluErf) {
+                                launch_act(std::integral_constant<int, 2>{});
+                              } else {
+                                launch_act(std::integral_constant<int, 1>{});
+                              }
+                              return;
+                            }
+                          }
                           if constexpr (kEnableRhtColQuant || kEnableRowQuant) {
                             detail::row_col_rht_gemm_ntt_w_sfc<
                                 kEnableStochasticRounding, kEnableRhtColQuant, kEnableRowQuant,

@@ -190,3 +190,26 @@ def test_weight_cast_carries_amax():
     carried(big)
     y = carried(big)
     assert torch.allclose(y._amax_rowwise, 2.0 * big.float().abs().amax(), rtol=1e-6)
+
+
+@pytest.mark.parametrize("act", ["gelu_erf", "gelu"])
+@pytest.mark.parametrize("stochastic_rounding", [False, True])
+def test_rht_fused_activation_matches_unfused(act, stochastic_rounding):
+    """The CUTLASS RHT cast applies the activation to its tiles: same data as act -> cast."""
+    torch.manual_seed(0)
+    _, fused = _quantizers(stochastic_rounding)
+    x = torch.randn(1024, 2048, dtype=torch.bfloat16, device="cuda")
+    fused(x)  # warm the carried amax
+    fn = getattr(tex, act)
+    if stochastic_rounding:
+        torch.manual_seed(1)
+    y_ref = fused(fn(x, None))
+    if stochastic_rounding:
+        torch.manual_seed(1)
+    y = fn(x, fused)
+    assert torch.equal(y._rowwise_data, y_ref._rowwise_data)
+    assert torch.equal(y._rowwise_scale_inv, y_ref._rowwise_scale_inv)
+    assert torch.equal(y._columnwise_data, y_ref._columnwise_data)
+    rows, half = y._columnwise_data.shape
+    cols = half * 2 // 16
+    assert torch.equal(y._columnwise_scale_inv[:rows, :cols], y_ref._columnwise_scale_inv[:rows, :cols])

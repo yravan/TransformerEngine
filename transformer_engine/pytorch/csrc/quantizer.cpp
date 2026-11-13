@@ -1996,6 +1996,22 @@ bool NVFP4Quantizer::fused_cast_eligible(const std::vector<size_t>& shape) const
   return rows % 64 == 0 && cols % 64 == 0 && cols > 0;
 }
 
+bool NVFP4Quantizer::rht_fused_act_eligible(const std::vector<size_t>& shape) const {
+  return this->delayed_amax && this->with_rht && this->with_post_rht_amax &&
+         !this->with_2d_quantization && !this->row_scaled_nvfp4 &&
+         !this->disable_second_level_scale && !this->with_amax_reduction &&
+         this->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled && this->rowwise_usage &&
+         this->columnwise_usage && !use_bidim_kernel() && this->amax_warm() &&
+         NVFP4Quantizer::is_eligible_for_rht_cast_fusion(shape);
+}
+
+void NVFP4Quantizer::quantize_fused_act(const TensorWrapper& input, TensorWrapper& out,
+                                        int32_t fused_act) {
+  this->pending_fused_act = fused_act;
+  this->quantize_impl(input, out, std::nullopt, true);
+  this->pending_fused_act = 0;
+}
+
 void NVFP4Quantizer::prepare_carried_amax(TensorWrapper& out, QuantizationConfigWrapper& config,
                                           std::vector<TensorWrapper>& keepalive,
                                           const std::function<void()>& measure) {
@@ -2851,8 +2867,11 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     if (eligible_for_rht_cast_fusion) {
       this->prepare_fused_cast(input, out, quant_config, keepalive, keepalive_torch);
       skip_amax = true;
+      if (this->pending_fused_act != 0) quant_config.set_nvfp4_fused_act(this->pending_fused_act);
     }
   }
+  NVTE_CHECK(this->pending_fused_act == 0 || skip_amax,
+             "The fused activation needs the warm carried-amax RHT cast fusion path.");
 
   // Compute amax.
   if (this->with_rht) {

@@ -38,7 +38,8 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
     FULLY_FUSED,
     FUSED_ACTIVATION_AMAX_FP8,
     FUSED_ACTIVATION_AMAX_NVFP4,
-    FUSED_NVFP4_SINGLE_PASS
+    FUSED_NVFP4_SINGLE_PASS,
+    FUSED_NVFP4_RHT_ACT
   };
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || detail::IsFloat8Quantizers(quantizer.ptr()) ||
@@ -49,7 +50,12 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (fused_kind != kNVTENVFP4FusedActNone && fused_kind != kNVTENVFP4FusedActSwiGLU &&
+    if ((fused_kind == kNVTENVFP4FusedActGelu || fused_kind == kNVTENVFP4FusedActGeluErf) &&
+        input_tensor.scalar_type() == at::kBFloat16 &&
+        nvfp4_quantizer_cpp->rht_fused_act_eligible(output_shape)) {
+      // The CUTLASS RHT cast kernel applies the activation to its A tiles in smem: no bf16 round trip.
+      impl = Impl::FUSED_NVFP4_RHT_ACT;
+    } else if (fused_kind != kNVTENVFP4FusedActNone && fused_kind != kNVTENVFP4FusedActSwiGLU &&
         fused_kind != kNVTENVFP4FusedActDSwiGLU && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
         nvfp4_quantizer_cpp->fused_cast_eligible(output_shape) &&
         input_tensor.scalar_type() == at::kBFloat16) {
@@ -155,6 +161,10 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
         nvte_nvfp4_quantize_fused(input_nvte.data(), nullptr, out_nvte.data(), nullptr, nullptr,
                                   fused_kind, config, stream);
       });
+    } break;
+    case Impl::FUSED_NVFP4_RHT_ACT: {
+      auto* nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer*>(quantizer_cpp.get());
+      nvfp4_quantizer_cpp->quantize_fused_act(input_nvte, out_nvte, fused_kind);
     } break;
     default:
       NVTE_ERROR("Invalid activation implementation (", static_cast<int>(impl), ")");

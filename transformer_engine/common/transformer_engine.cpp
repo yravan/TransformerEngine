@@ -1223,6 +1223,9 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
       std::memcpy(config_.rng_seed_offset, buf, attr_size);
       config_.rng_by_value = true;
       break;
+    case kNVTEQuantizationConfigNVFP4FusedAct:
+      std::memcpy(&config_.nvfp4_fused_act, buf, attr_size);
+      break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
   }
