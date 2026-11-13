@@ -332,6 +332,8 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
     float2 a = make_float2(0.f, 0.f);
 #pragma unroll
     for (int32_t r = 0; r < kBlock; ++r) {
+      // The reference RHT is a bf16 mma: its output is rounded to bf16 before the amax and the cast.
+      v[r] = __bfloat1622float2(__float22bfloat162_rn(v[r]));
       a = make_float2(fmaxf(a.x, fabsf(v[r].x)), fmaxf(a.y, fabsf(v[r].y)));
     }
     a = __fmul2_rn(a, make_float2(kHadamardScale, kHadamardScale));
