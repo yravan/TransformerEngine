@@ -18,6 +18,8 @@
 #include "common/cast/core/common.cuh"
 #include "common/cast/nvfp4/core_nvfp4.cuh"
 #include "common/cast/nvfp4/quantize_transpose_nvfp4.cuh"
+#include <transformer_engine/cast.h>
+
 #include "common/common.h"
 #include "common/util/math.h"
 #include "common/util/cuda_runtime.h"
@@ -1020,8 +1022,11 @@ __global__ static void row_col_rht_gemm_device(
             }
             copy(tiled_s2r, tQArA, tQAsA(_, _, _, mainloop_pipe_consumer_state.index()));
             cutlass::arch::fence_view_async_shared();
-            cutlass::arch::ClusterBarrier::arrive(
-                cute::cast_smem_ptr_to_uint(&shared_storage.xform_barrier[mainloop_pipe_consumer_state.index()]));
+            {
+              const uint32_t bar = cute::cast_smem_ptr_to_uint(
+                  &shared_storage.xform_barrier[mainloop_pipe_consumer_state.index()]);
+              asm volatile("{\n\t.reg .b64 st;\n\tmbarrier.arrive.shared::cta.b64 st, [%0];\n\t}" ::"r"(bar));
+            }
           }
           auto curr_mainloop_pipe_consumer_state = mainloop_pipe_consumer_state;
           ++mainloop_pipe_consumer_state;
