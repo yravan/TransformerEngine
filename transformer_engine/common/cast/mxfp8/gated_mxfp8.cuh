@@ -19,6 +19,7 @@
 #include "../../common.h"
 #include "../../util/cuda_runtime.h"
 #include "../../util/math.h"
+#include "../../util/system.h"
 #include "../../util/ptx_arch_spec.cuh"
 #include "../../utils.cuh"
 #include "specialized/cast_bidim_gated.cuh"
@@ -747,17 +748,15 @@ bool try_quantize_gated_bidim(const Tensor &gated_input, const Tensor &grad, Ten
     const int scale_stride_rowwise = output->scale_inv.shape[1];
     const int scale_stride_colwise = output->columnwise_scale_inv.shape[1];
     using quantize_kernel::specialized::launch_cast_bidim_gated;
-    if (output->with_gemm_swizzled_scales) {
-      launch_cast_bidim_gated<fp8e4m3, true, IS_BWD, ActOP>(
-          gated_input.data.dptr, grad.data.dptr, output->data.dptr, output->scale_inv.dptr,
-          output->columnwise_data.dptr, output->columnwise_scale_inv.dptr, rows, cols,
-          scale_stride_rowwise, scale_stride_colwise, stream);
-    } else {
-      launch_cast_bidim_gated<fp8e4m3, false, IS_BWD, ActOP>(
-          gated_input.data.dptr, grad.data.dptr, output->data.dptr, output->scale_inv.dptr,
-          output->columnwise_data.dptr, output->columnwise_scale_inv.dptr, rows, cols,
-          scale_stride_rowwise, scale_stride_colwise, stream);
-    }
+    static const bool fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
+    TRANSFORMER_ENGINE_SWITCH_CONDITION(
+        output->with_gemm_swizzled_scales, SWIZZLED_SCALES,
+        TRANSFORMER_ENGINE_SWITCH_CONDITION(fast_math, FAST_MATH, {
+          launch_cast_bidim_gated<fp8e4m3, SWIZZLED_SCALES, IS_BWD, FAST_MATH, ActOP>(
+              gated_input.data.dptr, grad.data.dptr, output->data.dptr, output->scale_inv.dptr,
+              output->columnwise_data.dptr, output->columnwise_scale_inv.dptr, rows, cols,
+              scale_stride_rowwise, scale_stride_colwise, stream);
+        }););
     return true;
   }
   return false;

@@ -23,7 +23,7 @@ namespace specialized {
 namespace bidim_detail {
 
 template <typename OType, int32_t COLS_PER_LANE, int32_t MIN_BLOCKS_PER_SM, bool SWIZZLED_SCALES,
-          bool IS_BWD, float (*ActOP)(float, const Empty &)>
+          bool IS_BWD, bool FAST_MATH, float (*ActOP)(float, const Empty &)>
 __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_gated_bidim_kernel(
     const uint8_t *__restrict__ gated_input, const uint8_t *__restrict__ grad,
     uint8_t *__restrict__ output_rowwise, uint8_t *__restrict__ scales_rowwise,
@@ -87,7 +87,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
         if constexpr (IS_BWD) {
           const float2 d =
               __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 &>(grad_tile[i][k]));
-          const float2 sg = sigmoid_x2(a);
+          const float2 sg = sigmoid_x2<FAST_MATH>(a);
           const float2 act = __fmul2_rn(a, sg);
           const float2 dact = __ffma2_rn(act, __ffma2_rn(sg, splat2(-1.f), splat2(1.f)), sg);
           const float2 after_act = __fmul2_rn(__fmul2_rn(dact, d), g);
@@ -97,7 +97,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void quantize_ga
           tile[0][i][k] = reinterpret_cast<const uint32_t &>(ra);
           tile[1][i][k] = reinterpret_cast<const uint32_t &>(rg);
         } else {
-          const float2 act = __fmul2_rn(__fmul2_rn(a, sigmoid_x2(a)), g);
+          const float2 act = __fmul2_rn(__fmul2_rn(a, sigmoid_x2<FAST_MATH>(a)), g);
           const __nv_bfloat162 r = __floats2bfloat162_rn(act.x, act.y);
           tile[0][i][k] = reinterpret_cast<const uint32_t &>(r);
         }
@@ -266,7 +266,8 @@ constexpr int32_t kGatedCluster = 1;
  * \param grad         BF16 [rows, cols], read only when IS_BWD.
  * \param output_*     FP8 [rows, cols], or [rows, 2 * cols] when IS_BWD (activation, then gate).
  */
-template <typename OType, bool SWIZZLED_SCALES, bool IS_BWD, float (*ActOP)(float, const Empty &)>
+template <typename OType, bool SWIZZLED_SCALES, bool IS_BWD, bool FAST_MATH,
+          float (*ActOP)(float, const Empty &)>
 inline void launch_cast_bidim_gated(const void *gated_input, const void *grad,
                                     void *output_rowwise, void *scales_rowwise,
                                     void *output_colwise, void *scales_colwise, int rows, int cols,
@@ -299,7 +300,7 @@ inline void launch_cast_bidim_gated(const void *gated_input, const void *grad,
   config.numAttrs = 1;
 
   auto kernel = quantize_gated_bidim_kernel<OType, kGatedColsPerLane, kGatedMinBlocksPerSm,
-                                            SWIZZLED_SCALES, IS_BWD, ActOP>;
+                                            SWIZZLED_SCALES, IS_BWD, FAST_MATH, ActOP>;
   NVTE_CHECK_CUDA(cudaLaunchKernelEx(
       &config, kernel, reinterpret_cast<const uint8_t *>(gated_input),
       reinterpret_cast<const uint8_t *>(grad), reinterpret_cast<uint8_t *>(output_rowwise),
