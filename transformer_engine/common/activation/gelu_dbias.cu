@@ -32,3 +32,16 @@ void nvte_quantize_dbias_dqgelu(const NVTETensor input, const NVTETensor activat
   dispatch::quantize_bwd_helper<IS_DBIAS, IS_DACT, Empty, dqgelu<fp32, fp32>>(
       input, activation_input, output, dbias, workspace, nullptr, stream);
 }
+
+void nvte_quantize_dbias_dgelu_erf(const NVTETensor input, const NVTETensor activation_input,
+                                   NVTETensor output, NVTETensor dbias, NVTETensor workspace,
+                                   cudaStream_t stream) {
+  NVTE_API_CALL(nvte_quantize_dbias_dgelu_erf);
+  using namespace transformer_engine;
+
+  constexpr bool IS_DBIAS = true;
+  constexpr bool IS_DACT = true;
+
+  dispatch::quantize_bwd_helper<IS_DBIAS, IS_DACT, Empty, dgelu_erf<fp32, fp32>>(
+      input, activation_input, output, dbias, workspace, nullptr, stream);
+}

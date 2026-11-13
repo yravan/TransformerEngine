@@ -22,6 +22,7 @@ from .._common import maybe_autocast_dtype, maybe_dequantize
 
 __all__ = [
     "GELU",
+    "GELUErf",
     "GEGLU",
     "GLU",
     "QGELU",
@@ -162,6 +163,24 @@ class GELU(_ActivationOperation):
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
         return tex.dgelu(*args, **kwargs)
+
+
+class GELUErf(_ActivationOperation):
+    r"""Gaussian Error Linear Unit, exact form
+
+    .. math::
+
+       \text{GELU}(x) = \frac{x}{2} \left( 1 + \text{erf}\left( \frac{x}{\sqrt{2}} \right) \right)
+
+    Matches ``torch.nn.functional.gelu(x, approximate="none")``.
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.gelu_erf(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.dgelu_erf(*args, **kwargs)
 
 
 class GLU(_ActivationOperation):

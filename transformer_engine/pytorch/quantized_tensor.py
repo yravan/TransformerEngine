@@ -473,6 +473,21 @@ class Quantizer(abc.ABC):
             ")"
         )
 
+    def copy(self) -> Quantizer:
+        """A shallow copy for one call.
+
+        Every attribute is shared, so the recipe state (scale and amax buffers, a
+        reduction group) stays common to the copies and only what a call
+        configures -- usage and layout flags -- diverges. A forward configures a
+        copy, never the stored quantizer (``TransformerEngineBaseModule._call_quantizer``),
+        so a custom recipe's quantizer needs no ``copy`` of its own. Not
+        ``copy.copy``: a quantizer's ``__getstate__`` may drop its reduction group
+        for pickling.
+        """
+        clone = self.__class__.__new__(self.__class__)
+        clone.__dict__.update(self.__dict__)
+        return clone
+
     def update_quantized(
         self,
         src: torch.Tensor,

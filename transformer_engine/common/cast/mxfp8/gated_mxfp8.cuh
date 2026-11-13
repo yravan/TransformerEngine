@@ -17,9 +17,12 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include "../../common.h"
+#include "../../util/cuda_runtime.h"
 #include "../../util/math.h"
+#include "../../util/system.h"
 #include "../../util/ptx_arch_spec.cuh"
 #include "../../utils.cuh"
+#include "specialized/cast_bidim_gated.cuh"
 #include "swizzle.cuh"
 
 namespace transformer_engine {
@@ -715,6 +718,50 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 
 }  // namespace gated_kernel
 
+template <auto Op>
+inline constexpr bool kIsSilu = false;
+template <>
+inline constexpr bool kIsSilu<&silu<fp32, fp32>> = true;
+template <auto Op>
+inline constexpr bool kIsDsilu = false;
+template <>
+inline constexpr bool kIsDsilu<&dsilu<fp32, fp32>> = true;
+
+template <bool IS_BWD, typename ParamOP, float (*ActOP)(float, const ParamOP &),
+          float (*DActOP)(float, const ParamOP &)>
+bool try_quantize_gated_bidim(const Tensor &gated_input, const Tensor &grad, Tensor *output,
+                              cudaStream_t stream) {
+  if constexpr (std::is_same_v<ParamOP, Empty> && kIsSilu<ActOP> &&
+                (!IS_BWD || kIsDsilu<DActOP>)) {
+    const size_t rows = gated_input.flat_first_dim();
+    const size_t cols = gated_input.flat_last_dim() / 2;
+    const bool eligible =
+        gated_input.dtype() == DType::kBFloat16 && output->dtype() == DType::kFloat8E4M3 &&
+        output->has_data() && output->has_columnwise_data() &&
+        rows % quantize_kernel::specialized::kGatedBidimRows == 0 &&
+        cols % quantize_kernel::specialized::kGatedBidimCols == 0 &&
+        transformer_engine::cuda::sm_arch() >= 100 && is_aligned_ptr(gated_input.data.dptr, 32) &&
+        (!IS_BWD || is_aligned_ptr(grad.data.dptr, 32));
+    if (!eligible) {
+      return false;
+    }
+    const int scale_stride_rowwise = output->scale_inv.shape[1];
+    const int scale_stride_colwise = output->columnwise_scale_inv.shape[1];
+    using quantize_kernel::specialized::launch_cast_bidim_gated;
+    static const bool fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
+    TRANSFORMER_ENGINE_SWITCH_CONDITION(
+        output->with_gemm_swizzled_scales, SWIZZLED_SCALES,
+        TRANSFORMER_ENGINE_SWITCH_CONDITION(fast_math, FAST_MATH, {
+          launch_cast_bidim_gated<fp8e4m3, SWIZZLED_SCALES, IS_BWD, FAST_MATH, ActOP>(
+              gated_input.data.dptr, grad.data.dptr, output->data.dptr, output->scale_inv.dptr,
+              output->columnwise_data.dptr, output->columnwise_scale_inv.dptr, rows, cols,
+              scale_stride_rowwise, scale_stride_colwise, stream);
+        }););
+    return true;
+  }
+  return false;
+}
+
 template <bool IS_BWD, typename ParamOP, float (*ActOP)(float, const ParamOP &),
           float (*DActOP)(float, const ParamOP &)>
 void quantize_gated(const Tensor &gated_input, const Tensor &grad, Tensor *output, ParamOP &p,
@@ -847,6 +894,13 @@ void quantize_gated(const Tensor &gated_input, const Tensor &grad, Tensor *outpu
                         cudaMemsetAsync(output->columnwise_scale_inv.dptr, 0,
                                         output->columnwise_scale_inv.buffer_size_bytes(), stream));
                   }
+                }
+              }
+
+              if constexpr (std::is_same_v<OType, fp8e4m3> && std::is_same_v<IType, bf16>) {
+                if (try_quantize_gated_bidim<IS_BWD, ParamOP, ActOP, DActOP>(gated_input, grad,
+                                                                             output, stream)) {
+                  return;
                 }
               }
 

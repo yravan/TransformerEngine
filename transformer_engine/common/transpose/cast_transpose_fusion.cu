@@ -481,7 +481,9 @@ static const char *ActTypeToString[] = {
     "relu",      // 9
     "drelu",     // 10
     "srelu",     // 11
-    "dsrelu"     // 12
+    "dsrelu",    // 12
+    "gelu_erf",  // 13
+    "dgelu_erf"  // 14
 };
 
 template <typename ComputeType, typename ParamOP, ComputeType (*OP)(ComputeType, const ParamOP &)>
@@ -499,7 +501,9 @@ constexpr int get_activation_type() {
       &relu<ComputeType, ComputeType>,      // 9
       &drelu<ComputeType, ComputeType>,     // 10
       &srelu<ComputeType, ComputeType>,     // 11
-      &dsrelu<ComputeType, ComputeType>     // 12
+      &dsrelu<ComputeType, ComputeType>,    // 12
+      &gelu_erf<ComputeType, ComputeType>,  // 13
+      &dgelu_erf<ComputeType, ComputeType>  // 14
   };
 #pragma unroll
   for (int i = 0; i < sizeof(ActivationList) / sizeof(ActivationList[0]); ++i) {
@@ -1247,9 +1251,13 @@ template void cast_transpose_fused<true, false, false, float, transformer_engine
 NVTE_INSTANTIATE_ACTIVATION(relu);
 NVTE_INSTANTIATE_ACTIVATION(srelu);
 NVTE_INSTANTIATE_ACTIVATION(gelu);
+NVTE_INSTANTIATE_ACTIVATION(gelu_erf);
 NVTE_INSTANTIATE_ACTIVATION(qgelu);
 NVTE_INSTANTIATE_ACTIVATION(silu);
 #undef NVTE_INSTANTIATE_ACTIVATION
+template void cast_transpose_fused<true, true, false, float, transformer_engine::Empty,
+                                   transformer_engine::dgelu_erf<float, float>>(
+    const Tensor &, const Tensor *, Tensor *, Tensor *, Tensor *, cudaStream_t);
 
 }  // namespace detail
 

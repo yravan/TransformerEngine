@@ -30,7 +30,7 @@ from transformer_engine.common.recipe import (
 )
 from .constants import dist_group_type, DType
 
-from .utils import get_device_compute_capability
+from .utils import get_device_compute_capability, warn_compile_eager_fallback
 from .jit import jit_fuser
 
 
@@ -275,6 +275,45 @@ def check_recipe_support(recipe: Recipe) -> None:
         recipe_supported, unsupported_reason = check_mxfp8_support()
     if not recipe_supported:
         raise RuntimeError(unsupported_reason)
+
+
+def recipe_compile_fallback_reason(recipe: Optional[Recipe] = None) -> Optional[str]:
+    """Why ``recipe`` -- the active quantization recipe when none is given -- has no
+    torch.compile path, or ``None``.
+
+    Decided from the recipe alone, so a compiled frame can branch on it without guarding
+    on any module's state, and a caller planning a compile can ask about a recipe it has
+    not entered yet. Delayed scaling keeps per-module scales and amax histories in
+    tensors that its quantizers read and update in place (they are not value-opaque), so
+    nothing built on it can run through a custom op; a compiled call runs it eagerly as a
+    whole (see ``forward_eagerly``).
+    """
+    if recipe is None:
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            return None
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+    if recipe.delayed():
+        return "delayed scaling has no torch.compile path"
+    return None
+
+
+def compiled_call_runs_eagerly() -> bool:
+    """Whether the forward dynamo is tracing must run outside it as a whole.
+
+    True when the active recipe has no torch.compile path
+    (``recipe_compile_fallback_reason``). Such a recipe has no traceable eager
+    path either -- quantizers that read data pointers, recipe state built on the
+    first call -- so a graph break would not do: dynamo would keep tracing the
+    resumed frame, including the module's autograd function. Warns once per
+    compilation.
+    """
+    if not torch.compiler.is_compiling():
+        return False
+    reason = recipe_compile_fallback_reason()
+    if reason is None:
+        return False
+    warn_compile_eager_fallback(reason)
+    return True
 
 
 def get_default_fp8_recipe() -> Recipe:

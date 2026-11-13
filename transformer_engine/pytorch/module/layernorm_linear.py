@@ -19,6 +19,7 @@ from transformer_engine.pytorch.torch_version import torch_version
 from transformer_engine.pytorch.tensor.utils import clear_columnwise_cache, is_custom
 from transformer_engine.pytorch.device import te_device_type
 from .base import (
+    forward_eagerly,
     fill_userbuffers_buffer_for_all_gather,
     get_cublasmp_all_gather_output,
     get_ub,
@@ -32,7 +33,11 @@ from .base import (
     _2X_ACC_DGRAD,
     _2X_ACC_WGRAD,
 )
-from ..quantization import FP8GlobalStateManager, QuantizerRole
+from ..quantization import (
+    FP8GlobalStateManager,
+    QuantizerRole,
+    compiled_call_runs_eagerly,
+)
 from ..utils import (
     assert_dim_for_fp8_exec,
     cast_if_needed,
@@ -2433,6 +2438,9 @@ class LayerNormLinear(TransformerEngineBaseModule):
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
         """
+        if compiled_call_runs_eagerly():
+            return forward_eagerly(self, inp, is_first_microbatch, fp8_output, fp8_grad)
+
         is_grad_enabled = torch.is_grad_enabled()
 
         if is_in_onnx_export_mode():
@@ -2672,20 +2680,20 @@ class LayerNormLinear(TransformerEngineBaseModule):
         grad_weight_quantizer = None
         grad_output_quantizer = None
         output_quantizer = None
-        input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+        input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_INPUT)
         input_quantizer.internal = True
         if not (self.parallel_mode == "column" and self.sequence_parallel):
             input_quantizer.optimize_for_gemm = True
         (weight_quantizer,) = self._get_weight_quantizers()
         if fp8_output:
-            output_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_OUTPUT]
+            output_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_OUTPUT)
         if is_grad_enabled:
-            grad_output_quantizer = self.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_OUTPUT1]
+            grad_output_quantizer = self._call_quantizer("scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT1)
             grad_output_quantizer.internal = True
             if not (self.parallel_mode == "row" and self.sequence_parallel):
                 grad_output_quantizer.optimize_for_gemm = True
             if fp8_grad:
-                grad_input_quantizer = self.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_INPUT1]
+                grad_input_quantizer = self._call_quantizer("scaling_bwd", FP8BwdTensorIdx.GRAD_INPUT1)
 
         return (
             input_quantizer,
@@ -2875,6 +2883,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
             return [None]
-        weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+        weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_WEIGHT)
         weight_quantizer.internal = True
         return [weight_quantizer]
