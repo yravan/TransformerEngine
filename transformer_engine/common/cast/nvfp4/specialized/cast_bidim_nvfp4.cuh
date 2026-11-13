@@ -21,6 +21,7 @@
 #include "../../../util/math.h"
 #include "../../../util/ptx.cuh"
 #include "../../../util/ptx_arch_spec.cuh"
+#include "../../../util/system.h"
 #include "../../../utils.cuh"
 #include "../core_nvfp4.cuh"
 #include "../swizzle.cuh"
@@ -474,22 +475,28 @@ inline void launch_cast_bidim_nvfp4(const void *input, const void *act_input, vo
       stream
   // The widest tile over as many columns as it covers, then one launch per narrower tail, so a
   // 1856-wide tensor runs 1792 columns at the 256-column rate and only 64 at the 64-column one.
+  // NVTE_NVFP4_BIDIM_MAX_CPL (8 / 4 / 2) caps the tile width: the best tile depends on the shape.
+  static const int max_cpl = [] {
+    const int v = transformer_engine::getenv<int>("NVTE_NVFP4_BIDIM_MAX_CPL", 8);
+    return v == 4 ? 4 : (v == 2 ? 2 : 8);
+  }();
   int base = 0;
-  const int wide = cols / 256 * 256;
+  const int wide = max_cpl >= 8 ? cols / 256 * 256 : 0;
   if (wide > 0) {
     launch_cast_bidim_nvfp4_cpl<8, kWideMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
                                 IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, wide));
     base += wide;
   }
-  if (cols - base >= 128) {
+  const int mid = max_cpl >= 4 ? (cols - base) / 128 * 128 : 0;
+  if (mid > 0) {
     launch_cast_bidim_nvfp4_cpl<4, kMidMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
-                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, 128));
-    base += 128;
+                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, mid));
+    base += mid;
   }
-  if (cols - base == 64) {
+  if (cols - base > 0) {
     launch_cast_bidim_nvfp4_cpl<2, kNarrowMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
-                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, 64));
-    base += 64;
+                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, cols - base));
+    base = cols;
   }
   NVTE_CHECK(base == cols, "NVFP4 bidim cast covered ", base, " of ", cols, " columns.");
 #undef NVTE_NVFP4_BIDIM_ARGS
