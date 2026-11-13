@@ -377,6 +377,7 @@ class NVFP4Quantizer : public Quantizer {
 
   /*! @brief Whether this quantizer's carried amax has been seeded by an exact first cast */
   bool amax_warm() const;
+  static bool use_bidim_kernel();
 
   /*! @brief Whether the single-pass fused cast with carried amax serves a tensor of this shape */
   bool fused_cast_eligible(const std::vector<size_t>& shape) const;

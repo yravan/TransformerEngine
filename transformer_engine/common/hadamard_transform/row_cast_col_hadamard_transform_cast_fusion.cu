@@ -189,6 +189,8 @@ __global__ static void row_col_rht_gemm_device(
     TiledMMA mma,
     float const* a_global_amax,
     float const* c_global_amax,
+    float* a_amax_out,
+    float* c_amax_out,
     const size_t* rng_state,
     int const k_tile_max_arg,
     uint32_t const tiles_in_m_arg,
@@ -741,6 +743,7 @@ __global__ static void row_col_rht_gemm_device(
       // Scaling factor for fast math path
       float global_encode_scale_multiplier = global_encode_scale * fp4_max_inv;
       auto sfc_converter = cutlass::NumericConverter<TSFD, float>{};
+      float col_amax_acc = 0.f;
 
       do {
         scheduler.fetch_next_work(clc_pipeline, clc_pipeline_consumer_state);
@@ -830,6 +833,7 @@ __global__ static void row_col_rht_gemm_device(
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < kVecsPerChunk; i++) {
               vec_maxs[i] = amax_reduction(ElementAccumulator(0), compute_frgs[c * kVecsPerChunk + i]);
+              col_amax_acc = fmaxf(col_amax_acc, vec_maxs[i]);
             }
             auto pvscales = mul_f32x2_by_scalar(vec_maxs, global_encode_scale_multiplier);
             sfd_chunks[c] = cutlass::NumericArrayConverter<TSFD, ElementAccumulator, kVecsPerChunk>{}(pvscales);
@@ -892,6 +896,13 @@ __global__ static void row_col_rht_gemm_device(
         }
         scheduler.update_work_tile_info();
       } while (scheduler.is_valid());
+      if (c_amax_out != nullptr) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int d = 16; d > 0; d >>= 1) {
+          col_amax_acc = fmaxf(col_amax_acc, __shfl_xor_sync(0xFFFFFFFFu, col_amax_acc, d));
+        }
+        if ((threadIdx.x & 31) == 0) atomicMaxFloat(c_amax_out, col_amax_acc);
+      }
     } else {
       cutlass::arch::warpgroup_reg_dealloc<32>();
     }
@@ -909,6 +920,7 @@ __global__ static void row_col_rht_gemm_device(
               : *a_global_amax;
       int global_thread_idx = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
       int local_thread_idx = global_thread_idx % 256;
+      float row_amax_acc = 0.f;
       size_t rng_seed = 0;
       size_t rng_offset = 0;
       if constexpr (kEnableStochasticRounding) {
@@ -996,6 +1008,7 @@ __global__ static void row_col_rht_gemm_device(
           for (int v = 0; v < size(tQArA)/VectorSize; v++) {
             auto compute_frgs_up = cutlass::NumericArrayConverter<ElementAccumulator, TA, VectorSize>{}(compute_frgs[v]);
             auto amax = amax_reduction(ElementAccumulator(0), compute_frgs_up);
+            row_amax_acc = fmaxf(row_amax_acc, amax);
             // declare pvscales
             ElementAccumulator pvscales;
             pvscales = cutlass::multiplies<ElementAccumulator>{}(amax, global_encode_scale_multiplier);
@@ -1045,6 +1058,13 @@ __global__ static void row_col_rht_gemm_device(
         ++clc_pipeline_consumer_state;
         scheduler.update_work_tile_info();
       }while (scheduler.is_valid());
+      if (a_amax_out != nullptr) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int d = 16; d > 0; d >>= 1) {
+          row_amax_acc = fmaxf(row_amax_acc, __shfl_xor_sync(0xFFFFFFFFu, row_amax_acc, d));
+        }
+        if ((threadIdx.x & 31) == 0) atomicMaxFloat(a_amax_out, row_amax_acc);
+      }
     } else {
       cutlass::arch::warpgroup_reg_dealloc<32>();
     }
@@ -1076,6 +1096,8 @@ void row_col_rht_gemm_ntt_w_sfc(
     TSFA* SFA,
     float const* a_global_amax,
     float const* d_global_amax,
+    float* a_amax_out,
+    float* d_amax_out,
     const size_t* rng_state,
     uint32_t sm_count,
     cudaStream_t stream,
@@ -1260,7 +1282,7 @@ void row_col_rht_gemm_ntt_w_sfc(
      tensorSFD.data(), sfd_layout,
      tensorQA.data(), dQA,
      tensorSFA.data(), sfa_layout,
-     mma, a_global_amax, d_global_amax, rng_state, k_tile_max, tiles_in_m, sched_tiles_in_n);
+     mma, a_global_amax, d_global_amax, a_amax_out, d_amax_out, rng_state, k_tile_max, tiles_in_m, sched_tiles_in_n);
 
   NVTE_CHECK_CUDA(cudaGetLastError());
   NVTE_CHECK(status == cutlass::Status::kSuccess, "Kernel launch failed.");
@@ -1362,6 +1384,14 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
   }
 
   auto sm_count = transformer_engine::cuda::sm_count();
+  // Fresh (post-cast) amaxes for the carried-amax recipe: {rowwise, columnwise} by atomic max.
+  float *amax_out = nullptr;
+  if (quant_config.nvfp4_amax_out != nullptr) {
+    const Tensor &t = *convertNVTETensorCheck(quant_config.nvfp4_amax_out);
+    NVTE_CHECK(t.data.dtype == DType::kFloat32 && t.data.numel() == 2,
+               "nvfp4_amax_out must hold 2 floats.");
+    amax_out = reinterpret_cast<float *>(t.data.dptr);
+  }
 
   NVTE_CHECK(n % hadamard_dimension == 0, "row_length must be divisible by hadamard_dimension.");
 
@@ -1419,6 +1449,7 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
                                 /*a_global_amax=*/reinterpret_cast<float const *>(rowwise_amax_ptr),
                                 /*d_global_amax=*/
                                 reinterpret_cast<float const *>(columnwise_amax_ptr),
+                                /*a_amax_out=*/amax_out, /*d_amax_out=*/amax_out ? amax_out + 1 : nullptr,
                                 /*rng_state=*/rng_state, /*sm_count=*/sm_count,
                                 /*stream=*/stream, /*k_tile_size=*/k_tile_size);
                           } else {

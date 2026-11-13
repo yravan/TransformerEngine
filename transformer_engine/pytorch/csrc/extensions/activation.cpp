@@ -49,7 +49,7 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() &&
+    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
         nvfp4_quantizer_cpp->fused_cast_eligible(output_shape) &&
         input_tensor.scalar_type() == at::kBFloat16) {
       // Single pass: activation, cast and both amaxes in one kernel, with carried global amaxes.
@@ -190,7 +190,7 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() &&
+    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
         nvfp4_quantizer_cpp->fused_cast_eligible(input_shape) &&
         input_tensor.scalar_type() == at::kBFloat16) {
       // Single pass: activation, cast and both amaxes in one kernel, with carried global amaxes.

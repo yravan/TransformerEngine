@@ -87,7 +87,7 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
     with_fused_kernel = true;
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     auto *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
-    if (nvfp4_quantizer_cpp->amax_warm() && nvfp4_quantizer_cpp->fused_cast_eligible(shape) &&
+    if (nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() && nvfp4_quantizer_cpp->fused_cast_eligible(shape) &&
         grad_output_torch.scalar_type() == at::kBFloat16) {
       // Single pass: dbias, cast and both amaxes in one kernel, with carried global amaxes
       std::vector<TensorWrapper> keepalive;
@@ -200,7 +200,7 @@ std::vector<py::object> dact_dbias(
   } else if (detail::IsNVFP4Quantizers(quantizer_py.ptr())) {
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer *>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
-    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() &&
+    if (fused_kind != kNVTENVFP4FusedActNone && nvfp4_quantizer_cpp->amax_warm() && NVFP4Quantizer::use_bidim_kernel() &&
         nvfp4_quantizer_cpp->fused_cast_eligible(input_shape) &&
         grad_output_torch.scalar_type() == at::kBFloat16 &&
         act_input_torch.scalar_type() == at::kBFloat16) {

@@ -1958,6 +1958,11 @@ NVFP4AmaxState& nvfp4_amax_state(int id) {
 
 }  // namespace
 
+bool NVFP4Quantizer::use_bidim_kernel() {
+  static const bool v = transformer_engine::getenv<bool>("NVTE_NVFP4_BIDIM");
+  return v;
+}
+
 bool NVFP4Quantizer::amax_warm() const {
   return this->delayed_amax && nvfp4_amax_state(this->amax_state_id).warm;
 }
@@ -2800,17 +2805,26 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     }
   }
 
-  // Single-pass fused cast with carried global amax.
-  if (compute_amax && this->fused_cast_eligible(convertShape(input.shape())) &&
-      input.dtype() == DType::kBFloat16) {
-    std::vector<TensorWrapper> keepalive;
-    std::vector<at::Tensor> keepalive_torch;
-    QuantizationConfigWrapper fused_config;
-    if (noop_flag) fused_config.set_noop_tensor(noop_flag->data());
-    this->prepare_fused_cast(input, out, fused_config, keepalive, keepalive_torch);
-    NVTE_SCOPED_GIL_RELEASE(
-        { nvte_quantize_v2(input.data(), out.data(), fused_config, stream); });
-    return;
+  // Carried global amax: the cast runs with the amaxes of the quantizer's previous casts and
+  // emits this tensor's amaxes for the next one, so the separate amax pass is skipped.
+  std::vector<TensorWrapper> keepalive;
+  std::vector<at::Tensor> keepalive_torch;
+  bool skip_amax = false;
+  if (compute_amax && this->delayed_amax && input.dtype() == DType::kBFloat16 && this->with_rht &&
+      this->with_post_rht_amax && !row_scaled_nvfp4 && !this->disable_second_level_scale &&
+      this->rowwise_usage && this->columnwise_usage) {
+    if (use_bidim_kernel() && this->fused_cast_eligible(convertShape(input.shape()))) {
+      QuantizationConfigWrapper fused_config;
+      if (noop_flag) fused_config.set_noop_tensor(noop_flag->data());
+      this->prepare_fused_cast(input, out, fused_config, keepalive, keepalive_torch);
+      NVTE_SCOPED_GIL_RELEASE(
+          { nvte_quantize_v2(input.data(), out.data(), fused_config, stream); });
+      return;
+    }
+    if (eligible_for_rht_cast_fusion) {
+      this->prepare_fused_cast(input, out, quant_config, keepalive, keepalive_torch);
+      skip_amax = true;
+    }
   }
 
   // Compute amax.
@@ -2823,7 +2837,7 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
       // We need:
       // 1. Rowwise amax = amax for input
       // 2. Columnwise amax = amax for RHT(input.t)
-      if (compute_amax && !this->disable_second_level_scale) {
+      if (compute_amax && !this->disable_second_level_scale && !skip_amax) {
         NVTE_SCOPED_GIL_RELEASE({
           nvte_hadamard_transform_amax(input.data(), out.data(), 0,
                                        this->rht_matrix_random_sign_mask_t, stream);
