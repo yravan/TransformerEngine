@@ -151,7 +151,6 @@ class NVFP4Quantizer(Quantizer):
     """Single-pass fused cast: take the global amaxes from this quantizer's previous casts"""
     delayed_amax: bool
     amax_margin: float
-    amax_state_id: str
 
     def __init__(
         self,
@@ -178,10 +177,11 @@ class NVFP4Quantizer(Quantizer):
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.delayed_amax = delayed_amax
         self.amax_margin = float(amax_margin)
-        # Identifies this quantizer's carried-amax state (a registry in the C++ extension), so a
-        # copy or a quantizer rebuilt from its value (torch.compile) keeps carrying the same amaxes.
-        # A string: torch.compile never turns it into a symbolic int (the C++ side parses it).
-        self.amax_state_id = str(next(_AMAX_STATE_IDS)) if amax_state_id is None else str(amax_state_id)
+        # Identifies this quantizer's carried-amax state (a registry in the C++ extension). Not a
+        # value field: baking it into the torch.compile constant would give every layer its own
+        # graph. A copy keeps the id; a quantizer rebuilt from its value gets one in
+        # ``_rebuild_derived_state`` (a string, so torch.compile never makes it symbolic).
+        self._amax_state_id = str(next(_AMAX_STATE_IDS)) if amax_state_id is None else str(amax_state_id)
         self.dtype = DType.cast(fp4_dtype)
         self.scale_dtype = DType.cast(scale_dtype)
         if self.scale_dtype not in (DType.kFloat8E4M3, DType.kFloat8UE5M3):
@@ -234,6 +234,8 @@ class NVFP4Quantizer(Quantizer):
         self.rht_matrix = get_rht_matrix(
             self.rht_matrix_random_sign_mask_t != 0, torch.cuda.current_device()
         )
+        if not hasattr(self, "_amax_state_id"):
+            self._amax_state_id = str(next(_AMAX_STATE_IDS))
 
     def update_quantized(
         self,
@@ -287,7 +289,7 @@ class NVFP4Quantizer(Quantizer):
             disable_second_level_scale=self.disable_second_level_scale,
             delayed_amax=self.delayed_amax,
             amax_margin=self.amax_margin,
-            amax_state_id=self.amax_state_id,
+            amax_state_id=self._amax_state_id,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm

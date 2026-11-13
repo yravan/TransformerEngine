@@ -1925,7 +1925,7 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
   if (py::hasattr(quantizer, "delayed_amax") && quantizer.attr("delayed_amax").cast<bool>()) {
     this->delayed_amax = true;
     this->amax_margin = quantizer.attr("amax_margin").cast<float>();
-    this->amax_state_id = std::stoi(quantizer.attr("amax_state_id").cast<std::string>());
+    this->amax_state_id = std::stoi(quantizer.attr("_amax_state_id").cast<std::string>());
   }
 }
 
