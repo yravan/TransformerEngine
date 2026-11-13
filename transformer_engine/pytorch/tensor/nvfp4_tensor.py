@@ -151,7 +151,7 @@ class NVFP4Quantizer(Quantizer):
     """Single-pass fused cast: take the global amaxes from this quantizer's previous casts"""
     delayed_amax: bool
     amax_margin: float
-    amax_state_id: int
+    amax_state_id: str
 
     def __init__(
         self,
@@ -173,14 +173,15 @@ class NVFP4Quantizer(Quantizer):
         disable_second_level_scale: bool = False,
         delayed_amax: bool = False,
         amax_margin: float = 1.25,
-        amax_state_id: Optional[int] = None,
+        amax_state_id: Optional[str] = None,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.delayed_amax = delayed_amax
         self.amax_margin = float(amax_margin)
         # Identifies this quantizer's carried-amax state (a registry in the C++ extension), so a
         # copy or a quantizer rebuilt from its value (torch.compile) keeps carrying the same amaxes.
-        self.amax_state_id = next(_AMAX_STATE_IDS) if amax_state_id is None else int(amax_state_id)
+        # A string: torch.compile never turns it into a symbolic int (the C++ side parses it).
+        self.amax_state_id = str(next(_AMAX_STATE_IDS)) if amax_state_id is None else str(amax_state_id)
         self.dtype = DType.cast(fp4_dtype)
         self.scale_dtype = DType.cast(scale_dtype)
         if self.scale_dtype not in (DType.kFloat8E4M3, DType.kFloat8UE5M3):
