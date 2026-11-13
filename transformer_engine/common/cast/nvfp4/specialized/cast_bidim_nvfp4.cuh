@@ -207,7 +207,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
     rng.init(rng_state);
   }
 
-  if constexpr (IS_ACT || IS_DACT) {
+  if constexpr (IS_ACT || IS_DACT || IS_DBIAS) {
     const uint8_t *act_in = act_input + (static_cast<size_t>(row0) * cols + col0) * sizeof(bf16);
     float2 column_sum[IS_DBIAS ? kWords : 1];
     if constexpr (IS_DBIAS) {
@@ -232,11 +232,14 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
       }
 #pragma unroll
       for (int32_t k = 0; k < kWords; ++k) {
-        float2 act_in_v = make_float2(0.f, 0.f);
-        if constexpr (IS_DACT) act_in_v = word_to_float2(act_row[k]);
-        const float2 value = activate_x2<IS_ACT, IS_DACT, ParamOP, OP>(word_to_float2(tile[i][k]), act_in_v);
-        const __nv_bfloat162 rounded = __floats2bfloat162_rn(value.x, value.y);
-        tile[i][k] = reinterpret_cast<const uint32_t &>(rounded);
+        float2 value = word_to_float2(tile[i][k]);
+        if constexpr (IS_ACT || IS_DACT) {
+          float2 act_in_v = make_float2(0.f, 0.f);
+          if constexpr (IS_DACT) act_in_v = word_to_float2(act_row[k]);
+          value = activate_x2<IS_ACT, IS_DACT, ParamOP, OP>(value, act_in_v);
+          const __nv_bfloat162 rounded = __floats2bfloat162_rn(value.x, value.y);
+          tile[i][k] = reinterpret_cast<const uint32_t &>(rounded);
+        }
         if constexpr (IS_DBIAS) column_sum[k] = __fadd2_rn(column_sum[k], value);
       }
     }
