@@ -264,6 +264,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("quantizer"));
   m.def("geglu", transformer_engine::pytorch::geglu, "GeGLU activation", py::arg("input"),
         py::arg("quantizer"));
+  m.def("gelu_erf", transformer_engine::pytorch::gelu_erf, "Exact (erf) GeLU activation",
+        py::arg("input"), py::arg("quantizer"));
+  m.def("geglu_erf", transformer_engine::pytorch::geglu_erf, "Exact (erf) GeGLU activation",
+        py::arg("input"), py::arg("quantizer"));
   m.def("qgelu", transformer_engine::pytorch::qgelu, "QuickGELU activation", py::arg("input"),
         py::arg("quantizer"));
   m.def("qgeglu", transformer_engine::pytorch::qgeglu, "QuickGeGLU activation", py::arg("input"),
@@ -295,6 +299,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("fwd_input"), py::arg("quantizer"));
   m.def("dgeglu", transformer_engine::pytorch::dgeglu, "Backward of GeGLU", py::arg("grad"),
         py::arg("fwd_input"), py::arg("quantizer"));
+  m.def("dgelu_erf", transformer_engine::pytorch::dgelu_erf, "Backward of exact (erf) GeLU",
+        py::arg("grad"), py::arg("fwd_input"), py::arg("quantizer"));
+  m.def("dgeglu_erf", transformer_engine::pytorch::dgeglu_erf, "Backward of exact (erf) GeGLU",
+        py::arg("grad"), py::arg("fwd_input"), py::arg("quantizer"));
   m.def("dqgelu", transformer_engine::pytorch::dqgelu, "Backward of QuickGELU", py::arg("grad"),
         py::arg("fwd_input"), py::arg("quantizer"));
   m.def("dqgeglu", transformer_engine::pytorch::dqgeglu, "Backward of QuickGeGLU", py::arg("grad"),
@@ -351,6 +359,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   /* DBias + DAct fusions*/
   m.def("dbias_dgelu", transformer_engine::pytorch::dbias_dgelu, "DGeLU + DBias + Quantize",
         py::arg("grad"), py::arg("fwd_input"), py::arg("quantizer"));
+  m.def("dbias_dgelu_erf", transformer_engine::pytorch::dbias_dgelu_erf,
+        "Exact (erf) DGeLU + DBias + Quantize", py::arg("grad"), py::arg("fwd_input"),
+        py::arg("quantizer"));
   m.def("dbias_dsilu", transformer_engine::pytorch::dbias_dsilu, "DSiLU + DBias + Quantize",
         py::arg("grad"), py::arg("fwd_input"), py::arg("quantizer"));
   m.def("dbias_drelu", transformer_engine::pytorch::dbias_drelu, "DReLU + DBias + Quantize",

@@ -4523,6 +4523,17 @@ class TestCheckpointing:
 class TestSequentialModules:
     """Test for larger Sequentials with modules commonly used together"""
 
+    @pytest.mark.parametrize("bias", (False, True))
+    def test_linear_state_dict_strict_round_trip(self, *, bias: bool, device: torch.device = "cuda") -> None:
+        """A Linear op's state dict loads back strictly, with or without a bias"""
+        model = te_ops.Sequential(te_ops.Linear(32, 32, bias=bias, device=device))
+        state = model.state_dict()
+        model.load_state_dict(state, strict=True)
+        fresh = te_ops.Sequential(te_ops.Linear(32, 32, bias=bias, device=device))
+        fresh.load_state_dict(state, strict=True)
+        for (name, p), (_, q) in zip(model.named_parameters(), fresh.named_parameters()):
+            torch.testing.assert_close(q, p, rtol=0, atol=0, msg=name)
+
     @pytest.mark.parametrize("requires_grad", (False, True))
     @pytest.mark.parametrize("bias", (False, True))
     @pytest.mark.parametrize("quantized_compute", (False, True))

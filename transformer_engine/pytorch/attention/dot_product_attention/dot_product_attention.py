@@ -13,7 +13,6 @@ import logging
 from packaging.version import Version as PkgVersion
 import torch
 import torch.nn.functional as F
-from torch.fx.experimental.symbolic_shapes import guard_scalar
 from torch.nn.parameter import Parameter
 
 from transformer_engine.pytorch.device import te_device_type
@@ -1935,6 +1934,75 @@ class DotProductAttention(TransformerEngineBaseModule):
             return padded_output
         return padded_output + grouped_output
 
+    def _select_attention_backends(self, attention_params: dpa_utils.AttentionParams):
+        """Backend selection for ``attention_params``: ``(use_flash_attention,
+        flash_attention_backend, use_fused_attention, fused_attention_backend,
+        use_unfused_attention)``.
+
+        An eager call memoizes the selection in the process-global ``_attention_backends``
+        and logs it when it changes. A compiled call selects directly: dynamo guards on
+        everything a frame reads, so reading the cache would tie the graph to whichever
+        call ran last and recompile every time callers with different shapes alternate.
+        Selection is a function of ``attention_params``, which the graph specializes on
+        anyway.
+        """
+        if torch.compiler.is_compiling():
+            (
+                use_flash_attention,
+                flash_attention_backend,
+                use_fused_attention,
+                fused_attention_backend,
+                use_unfused_attention,
+                _,
+            ) = dpa_utils.get_attention_backend(attention_params)
+            return (
+                use_flash_attention,
+                flash_attention_backend,
+                use_fused_attention,
+                fused_attention_backend,
+                use_unfused_attention,
+            )
+        if (
+            _attention_backends["attention_params"] is None
+            or attention_params != _attention_backends["attention_params"]
+        ):
+            _attention_backends["attention_params"] = attention_params
+            _attention_backends["backend_selection_requires_update"] = True
+        if _attention_backends["backend_selection_requires_update"]:
+            (
+                use_flash_attention,
+                flash_attention_backend,
+                use_fused_attention,
+                fused_attention_backend,
+                use_unfused_attention,
+                _,
+            ) = dpa_utils.get_attention_backend(attention_params)
+            _attention_backends["use_flash_attention"] = use_flash_attention
+            _attention_backends["flash_attention_backend"] = flash_attention_backend
+            _attention_backends["use_fused_attention"] = use_fused_attention
+            _attention_backends["fused_attention_backend"] = fused_attention_backend
+            _attention_backends["use_unfused_attention"] = use_unfused_attention
+            _attention_backends["backend_selection_requires_update"] = False
+            if use_flash_attention:
+                self.logger.info(
+                    "Running with FlashAttention backend (version %s)",
+                    flash_attention_backend,
+                )
+            elif use_fused_attention:
+                self.logger.info(
+                    "Running with FusedAttention backend (sub-backend %s)",
+                    int(fused_attention_backend),
+                )
+            elif use_unfused_attention:
+                self.logger.info("Running with UnfusedDotProductAttention backend")
+        return (
+            _attention_backends["use_flash_attention"],
+            _attention_backends["flash_attention_backend"],
+            _attention_backends["use_fused_attention"],
+            _attention_backends["fused_attention_backend"],
+            _attention_backends["use_unfused_attention"],
+        )
+
     @no_torch_dynamo(when=_needs_eager_dpa)
     def forward(
         self,
@@ -2417,8 +2485,9 @@ class DotProductAttention(TransformerEngineBaseModule):
             # harmless, because the backends disagree about it. tanh is odd, so
             # UnfusedDotProductAttention's `cap * tanh(x / cap)` applies a negative cap as its
             # absolute value and yields NaN for a non-finite one, while FlashAttention caps only
-            # when `softcap > 0` and so drops both without a word.
-            if not math.isfinite(softcap) or softcap < 0.0:
+            # when `softcap > 0` and so drops both without a word. Spelled as comparisons
+            # (NaN fails both) so a symbolic cap under torch.compile is guarded, not a graph break.
+            if not 0.0 <= softcap < math.inf:
                 raise ValueError(f"softcap must be finite and non-negative, got {softcap}.")
 
             # checks for qkv_format
@@ -2442,10 +2511,6 @@ class DotProductAttention(TransformerEngineBaseModule):
                     batch_size = query_layer.shape[0]
                     max_seqlen_q = query_layer.shape[1] if max_seqlen_q is None else max_seqlen_q
                     max_seqlen_kv = key_layer.shape[1] if max_seqlen_kv is None else max_seqlen_kv
-                # Backend selection bakes these in, which it cannot do symbolically.
-                if not is_in_onnx_export_mode():
-                    max_seqlen_q = guard_scalar(max_seqlen_q)
-                    max_seqlen_kv = guard_scalar(max_seqlen_kv)
             if qkv_format == "thd":
                 assert all(
                     len(x.shape) == 3 for x in (query_layer, key_layer, value_layer)
@@ -2852,54 +2917,13 @@ class DotProductAttention(TransformerEngineBaseModule):
                 use_fused_attention = False
                 use_unfused_attention = True
             else:
-                if (
-                    _attention_backends["attention_params"] is None
-                    or attention_params != _attention_backends["attention_params"]
-                ):
-                    _attention_backends["attention_params"] = attention_params
-                    _attention_backends["backend_selection_requires_update"] = True
-                if _attention_backends["backend_selection_requires_update"]:
-                    (
-                        use_flash_attention,
-                        flash_attention_backend,
-                        use_fused_attention,
-                        fused_attention_backend,
-                        use_unfused_attention,
-                        _,
-                    ) = dpa_utils.get_attention_backend(attention_params)
-                    # Set global _attention_backends var using return value
-                    # from get_attention_backend()
-                    _attention_backends["use_flash_attention"] = use_flash_attention
-                    _attention_backends["flash_attention_backend"] = flash_attention_backend
-                    _attention_backends["use_fused_attention"] = use_fused_attention
-                    _attention_backends["fused_attention_backend"] = fused_attention_backend
-                    _attention_backends["use_unfused_attention"] = use_unfused_attention
-                    _attention_backends["backend_selection_requires_update"] = False
-                    # logging.Logger methods graph-break under torch.compile, so
-                    # selection is only logged in eager -- as in
-                    # get_attention_backend. Note the arguments below are
-                    # evaluated either way, so they have to stay traceable.
-                    logger = (
-                        dpa_utils.no_op_logger if torch.compiler.is_compiling() else self.logger
-                    )
-                    if use_flash_attention:
-                        logger.info(
-                            "Running with FlashAttention backend (version %s)",
-                            flash_attention_backend,
-                        )
-                    elif use_fused_attention:
-                        logger.info(
-                            "Running with FusedAttention backend (sub-backend %s)",
-                            int(fused_attention_backend),
-                        )
-                    elif use_unfused_attention:
-                        logger.info("Running with UnfusedDotProductAttention backend")
-                else:
-                    use_flash_attention = _attention_backends["use_flash_attention"]
-                    flash_attention_backend = _attention_backends["flash_attention_backend"]
-                    use_fused_attention = _attention_backends["use_fused_attention"]
-                    fused_attention_backend = _attention_backends["fused_attention_backend"]
-                    use_unfused_attention = _attention_backends["use_unfused_attention"]
+                (
+                    use_flash_attention,
+                    flash_attention_backend,
+                    use_fused_attention,
+                    fused_attention_backend,
+                    use_unfused_attention,
+                ) = self._select_attention_backends(attention_params)
 
             # raise exception if no backend is available
             if sum([use_flash_attention, use_fused_attention, use_unfused_attention]) == 0:

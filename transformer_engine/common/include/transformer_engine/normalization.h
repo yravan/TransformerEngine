@@ -49,6 +49,25 @@ void nvte_layernorm_fwd(const NVTETensor x, const NVTETensor gamma, const NVTETe
                         NVTETensor workspace, const int multiprocessorCount,
                         const bool zero_centered_gamma, cudaStream_t stream);
 
+/*! \brief Whether nvte_layernorm_fwd would write this MXFP8 output in one fused kernel.
+ *
+ *  The fused kernel's output is byte-identical to nvte_layernorm_fwd into a tensor of the input
+ *  dtype followed by nvte_quantize, and it writes GEMM-swizzled scaling factors when z requests
+ *  them. It supports BF16 input and weights, row-wise and column-wise output, rows a multiple of
+ *  128 and 768 or 1024 columns; false means nvte_layernorm_fwd would reject a
+ *  GEMM-swizzled z and quantize an unswizzled one through cuDNN.
+ *
+ *  \param[in]     x                   Input tensor of shape [..., H].
+ *  \param[in]     gamma               Gamma tensor of shape [H].
+ *  \param[in]     beta                Beta tensor of shape [H].
+ *  \param[in]     z                   MXFP8 output tensor of shape [..., H].
+ *  \param[in]     mu                  Mean output tensor of shape [N].
+ *  \param[in]     rsigma              Inverse standard deviation output tensor of shape [N].
+ */
+bool nvte_layernorm_fwd_mxfp8_fused(const NVTETensor x, const NVTETensor gamma,
+                                    const NVTETensor beta, const NVTETensor z, const NVTETensor mu,
+                                    const NVTETensor rsigma);
+
 /*! \brief Compute backward of LayerNorm.
  *
  * This function computes the gradient of function:

@@ -2672,20 +2672,20 @@ class LayerNormLinear(TransformerEngineBaseModule):
         grad_weight_quantizer = None
         grad_output_quantizer = None
         output_quantizer = None
-        input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+        input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_INPUT)
         input_quantizer.internal = True
         if not (self.parallel_mode == "column" and self.sequence_parallel):
             input_quantizer.optimize_for_gemm = True
         (weight_quantizer,) = self._get_weight_quantizers()
         if fp8_output:
-            output_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_OUTPUT]
+            output_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_OUTPUT)
         if is_grad_enabled:
-            grad_output_quantizer = self.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_OUTPUT1]
+            grad_output_quantizer = self._call_quantizer("scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT1)
             grad_output_quantizer.internal = True
             if not (self.parallel_mode == "row" and self.sequence_parallel):
                 grad_output_quantizer.optimize_for_gemm = True
             if fp8_grad:
-                grad_input_quantizer = self.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_INPUT1]
+                grad_input_quantizer = self._call_quantizer("scaling_bwd", FP8BwdTensorIdx.GRAD_INPUT1)
 
         return (
             input_quantizer,
@@ -2875,6 +2875,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
             return [None]
-        weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+        weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_WEIGHT)
         weight_quantizer.internal = True
         return [weight_quantizer]
