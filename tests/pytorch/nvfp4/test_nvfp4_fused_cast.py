@@ -41,6 +41,13 @@ def _dq(t):
 _E2M1 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6])
 
 
+def _block_step(dq_ref):
+    """The largest E2M1 step inside each 16-element block (the 4->6 step is 2 scale units)."""
+    rows, cols = dq_ref.shape
+    block_amax = dq_ref.abs().reshape(rows, cols // 16, 16).amax(dim=2, keepdim=True)
+    return (block_amax / 3).expand(rows, cols // 16, 16).reshape(rows, cols)
+
+
 def _col_dq(t):
     """Dequantize the columnwise (transposed, RHT'd) copy: compact E4M3 scales, 16-wide blocks."""
     data = t._columnwise_data.view(torch.uint8)
@@ -68,17 +75,15 @@ def test_plain_cast_matches_reference(shape, stochastic_rounding):
     assert torch.equal(y._rowwise_scale_inv, y_ref._rowwise_scale_inv)
     dq, dq_ref = _dq(y), _dq(y_ref)
     if stochastic_rounding:
-        step = (dq_ref.abs().amax(dim=1, keepdim=True) / 6 * 2).clamp(min=1e-3)
-        assert ((dq - dq_ref).abs() <= step).all()
+        # Both casts round stochastically with their own seeds: up to one step each.
+        assert ((dq - dq_ref).abs() <= 2 * _block_step(dq_ref)).all()
     else:
         assert torch.equal(y._rowwise_data, y_ref._rowwise_data)
-    # Columnwise: same transform, f32 sums in a different order -> rare one-step differences.
     cdq, cdq_ref = _col_dq(y), _col_dq(y_ref)
     scales_equal = (y._columnwise_scale_inv == y_ref._columnwise_scale_inv).float().mean()
     assert scales_equal > 0.999
     diff = (cdq - cdq_ref).abs()
-    step = cdq_ref.abs().amax(dim=1, keepdim=True) / 6 * (2 if stochastic_rounding else 1)
-    assert (diff <= step + 1e-6).all()
+    assert (diff <= (2 if stochastic_rounding else 1) * _block_step(cdq_ref) + 1e-6).all()
     if not stochastic_rounding:
         assert (diff > 0).float().mean() < 1e-3
 
@@ -96,8 +101,7 @@ def test_fused_activation_matches_unfused(act):
     assert torch.equal(y._rowwise_data, y_ref._rowwise_data)
     assert torch.equal(y._rowwise_scale_inv, y_ref._rowwise_scale_inv)
     cdq, cdq_ref = _col_dq(y), _col_dq(y_ref)
-    step = cdq_ref.abs().amax(dim=1, keepdim=True) / 6
-    assert ((cdq - cdq_ref).abs() <= step + 1e-6).all()
+    assert ((cdq - cdq_ref).abs() <= _block_step(cdq_ref) + 1e-6).all()
 
 
 @pytest.mark.parametrize("act", ["dgelu", "dgelu_erf"])
@@ -113,8 +117,7 @@ def test_fused_dbias_dact_matches_unfused(act):
     assert torch.equal(y._amax_rowwise, y_ref._amax_rowwise)
     assert torch.allclose(db.float(), db_ref.float(), rtol=2e-2, atol=0.5)
     dq, dq_ref = _dq(y), _dq(y_ref)
-    step = dq_ref.abs().amax(dim=1, keepdim=True) / 6 * 2
-    assert ((dq - dq_ref).abs() <= step + 1e-6).all()
+    assert ((dq - dq_ref).abs() <= 2 * _block_step(dq_ref) + 1e-6).all()
 
 
 def test_plain_dbias_matches_unfused():
