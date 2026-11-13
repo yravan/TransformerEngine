@@ -208,23 +208,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
   }
 
   if constexpr (IS_ACT || IS_DACT) {
-    uint32_t act_tile[kRowsPerLane][IS_DACT ? kWords : 1];
-    if constexpr (IS_DACT) {
-      const uint8_t *act_in = act_input + (static_cast<size_t>(row0) * cols + col0) * sizeof(bf16);
-#pragma unroll
-      for (int32_t i = 0; i < kRowsPerLane; ++i) {
-        const void *src = act_in + i * row_stride_bytes;
-        if constexpr (kWords == 4) {
-          ptx::ld_global_nc_b32x4(act_tile[i], src, policy);
-        } else if constexpr (kWords == 2) {
-          const uint2 v = __ldg(reinterpret_cast<const uint2 *>(src));
-          act_tile[i][0] = v.x;
-          act_tile[i][1] = v.y;
-        } else {
-          act_tile[i][0] = __ldg(reinterpret_cast<const uint32_t *>(src));
-        }
-      }
-    }
+    const uint8_t *act_in = act_input + (static_cast<size_t>(row0) * cols + col0) * sizeof(bf16);
     float2 column_sum[IS_DBIAS ? kWords : 1];
     if constexpr (IS_DBIAS) {
 #pragma unroll
@@ -232,11 +216,25 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
     }
 #pragma unroll 2
     for (int32_t i = 0; i < kRowsPerLane; ++i) {
+      // The activation input is loaded one row at a time: holding the whole tile spills.
+      uint32_t act_row[kWords];
+      if constexpr (IS_DACT) {
+        const void *src = act_in + i * row_stride_bytes;
+        if constexpr (kWords == 4) {
+          ptx::ld_global_nc_b32x4(act_row, src, policy);
+        } else if constexpr (kWords == 2) {
+          const uint2 v = __ldg(reinterpret_cast<const uint2 *>(src));
+          act_row[0] = v.x;
+          act_row[1] = v.y;
+        } else {
+          act_row[0] = __ldg(reinterpret_cast<const uint32_t *>(src));
+        }
+      }
 #pragma unroll
       for (int32_t k = 0; k < kWords; ++k) {
-        float2 act_in = make_float2(0.f, 0.f);
-        if constexpr (IS_DACT) act_in = word_to_float2(act_tile[i][k]);
-        const float2 value = activate_x2<IS_ACT, IS_DACT, ParamOP, OP>(word_to_float2(tile[i][k]), act_in);
+        float2 act_in_v = make_float2(0.f, 0.f);
+        if constexpr (IS_DACT) act_in_v = word_to_float2(act_row[k]);
+        const float2 value = activate_x2<IS_ACT, IS_DACT, ParamOP, OP>(word_to_float2(tile[i][k]), act_in_v);
         const __nv_bfloat162 rounded = __floats2bfloat162_rn(value.x, value.y);
         tile[i][k] = reinterpret_cast<const uint32_t &>(rounded);
         if constexpr (IS_DBIAS) column_sum[k] = __fadd2_rn(column_sum[k], value);

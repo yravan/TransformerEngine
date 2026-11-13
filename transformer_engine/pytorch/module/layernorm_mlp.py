@@ -133,7 +133,12 @@ def _get_act_func_supported_list(
             "swiglu": (tex.swiglu, tex.dswiglu, None),
             "clamped_swiglu": (tex.clamped_swiglu, tex.clamped_dswiglu, None),
         }
-    if dbias_fusion is True or recipe.delayed() or recipe.mxfp8():
+    if (
+        dbias_fusion is True
+        or recipe.delayed()
+        or recipe.mxfp8()
+        or (recipe.nvfp4() and getattr(recipe, "delayed_amax", False))
+    ):
         # Delayed scaling, fusion supported list: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
         # MXFP8: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
         return {
