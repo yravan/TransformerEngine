@@ -2171,7 +2171,11 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(
     // nvte_compute_amax_with_config will zero out the pointer if needed
     const int64_t amax_cols = row_scaled_nvfp4 ? static_cast<int64_t>(flat_last_dim) : 1;
     if (!disable_second_level_scale) {
-      amax_columnwise = at::empty({amax_cols}, bit32_tensor_opts);
+      // Without RHT both amaxes are the same number: share the buffer so the
+      // rowwise->columnwise device copies after the amax kernel become no-ops.
+      amax_columnwise = (!this->with_rht && !row_scaled_nvfp4 && amax_rowwise.defined())
+                            ? amax_rowwise
+                            : at::empty({amax_cols}, bit32_tensor_opts);
     }
   }
 
