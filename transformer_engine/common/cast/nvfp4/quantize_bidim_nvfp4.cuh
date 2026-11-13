@@ -109,23 +109,33 @@ void quantize_bidim(const Tensor &input, const Tensor *act_input, Tensor *output
 
 namespace carry {
 
-static __global__ void carry_amax_kernel(float *__restrict__ history, float *__restrict__ fresh,
-                                  int32_t *__restrict__ step, const float margin,
-                                  const int32_t history_len, float *__restrict__ amax_rowwise,
-                                  float *__restrict__ amax_columnwise) {
+static __global__ void __launch_bounds__(32) carry_amax_kernel(
+    float *__restrict__ history, float *__restrict__ fresh, int32_t *__restrict__ step,
+    const float margin, const int32_t history_len, float *__restrict__ amax_rowwise,
+    float *__restrict__ amax_columnwise) {
   const int32_t slot = *step % history_len;
-  history[slot] = fresh[0];
-  history[history_len + slot] = fresh[1];
+  if (threadIdx.x == 0) {
+    history[slot] = fresh[0];
+    history[history_len + slot] = fresh[1];
+  }
+  __syncwarp();
   float r = 0.f, c = 0.f;
-  for (int32_t i = 0; i < history_len; ++i) {
+  for (int32_t i = threadIdx.x; i < history_len; i += 32) {
     r = fmaxf(r, history[i]);
     c = fmaxf(c, history[history_len + i]);
   }
-  *amax_rowwise = r * margin;
-  *amax_columnwise = c * margin;
-  fresh[0] = 0.f;
-  fresh[1] = 0.f;
-  *step += 1;
+#pragma unroll
+  for (int32_t d = 16; d > 0; d >>= 1) {
+    r = fmaxf(r, __shfl_xor_sync(0xFFFFFFFFu, r, d));
+    c = fmaxf(c, __shfl_xor_sync(0xFFFFFFFFu, c, d));
+  }
+  if (threadIdx.x == 0) {
+    *amax_rowwise = r * margin;
+    *amax_columnwise = c * margin;
+    fresh[0] = 0.f;
+    fresh[1] = 0.f;
+    *step += 1;
+  }
 }
 
 }  // namespace carry
@@ -139,7 +149,7 @@ inline void carry_amax(const Tensor &history, Tensor &fresh, Tensor &step, float
              "NVFP4 fresh amax must hold 2 floats.");
   NVTE_CHECK(step.data.dtype == DType::kInt32 && step.data.numel() == 1,
              "NVFP4 amax step must be 1 int32.");
-  carry::carry_amax_kernel<<<1, 1, 0, stream>>>(
+  carry::carry_amax_kernel<<<1, 32, 0, stream>>>(
       reinterpret_cast<float *>(history.data.dptr), reinterpret_cast<float *>(fresh.data.dptr),
       reinterpret_cast<int32_t *>(step.data.dptr), margin,
       static_cast<int32_t>(history.data.shape[1]),
