@@ -74,8 +74,15 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
       // Compute activation in high precision, then quantize
       {
         auto [temp_nvte, _] = NoneQuantizer(py::none()).create_tensor(output_shape, fake_dtype);
+        const bool bandwidth_act = fused_kind != kNVTENVFP4FusedActNone &&
+                                   detail::IsNVFP4Quantizers(quantizer.ptr()) &&
+                                   input_tensor.scalar_type() == at::kBFloat16 &&
+                                   output_shape.back() % 8 == 0;
         NVTE_SCOPED_GIL_RELEASE({
-          if constexpr (act_func == nullptr) {
+          if (bandwidth_act) {
+            nvte_nvfp4_act_bf16(input_nvte.data(), nullptr, temp_nvte.data(), nullptr, nullptr,
+                                fused_kind, stream);
+          } else if constexpr (act_func == nullptr) {
             act_func_with_args(input_nvte.data(), temp_nvte.data(), std::forward<Args>(args)...,
                                stream);
           } else {
@@ -215,8 +222,16 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
       // Compute activation backward in high precision, then quantize
       {
         auto [temp_nvte, _] = NoneQuantizer(py::none()).create_tensor(input_shape, fake_dtype);
+        const bool bandwidth_act = fused_kind != kNVTENVFP4FusedActNone &&
+                                   detail::IsNVFP4Quantizers(quantizer.ptr()) &&
+                                   grad_output_tensor.scalar_type() == at::kBFloat16 &&
+                                   input_tensor.scalar_type() == at::kBFloat16 &&
+                                   input_shape.back() % 8 == 0;
         NVTE_SCOPED_GIL_RELEASE({
-          if constexpr (dact_func == nullptr) {
+          if (bandwidth_act) {
+            nvte_nvfp4_act_bf16(grad_output_nvte.data(), input_nvte.data(), temp_nvte.data(),
+                                nullptr, nullptr, fused_kind, stream);
+          } else if constexpr (dact_func == nullptr) {
             dact_func_with_args(grad_output_nvte.data(), input_nvte.data(), temp_nvte.data(),
                                 std::forward<Args>(args)..., stream);
           } else {

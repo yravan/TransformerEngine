@@ -564,6 +564,17 @@ void nvte_nvfp4_carry_amax(NVTETensor history, NVTETensor fresh, NVTETensor step
                            NVTETensor amax_rowwise, NVTETensor amax_columnwise,
                            cudaStream_t stream);
 
+/*! \brief BF16 activation / activation backward (+ bias gradient) at memory bandwidth.
+ *
+ *  Forward kinds: output = act(input). Backward kinds: output = input * act'(act_input).
+ *  kNVTENVFP4FusedActNone: output = input (output may be NULL when only dbias is wanted).
+ *  dbias (NULL for none) receives the column sums of the output through the two-call workspace
+ *  protocol (first call with an empty workspace returns its shape).
+ */
+void nvte_nvfp4_act_bf16(const NVTETensor input, const NVTETensor act_input, NVTETensor output,
+                         NVTETensor dbias, NVTETensor workspace, NVTENVFP4FusedAct act,
+                         cudaStream_t stream);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

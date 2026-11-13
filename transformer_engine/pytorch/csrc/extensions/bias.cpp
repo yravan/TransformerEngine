@@ -23,6 +23,28 @@ namespace pytorch {
 namespace {
 
 // Sum token dimensions directly; no ATen reshape/view is needed for N-D input.
+// BF16 activation(-backward) with the bias gradient at memory bandwidth (two-call workspace).
+void act_bf16_dbias(const TensorWrapper &input, const TensorWrapper *act_input, TensorWrapper *output,
+                    TensorWrapper &dbias, NVTENVFP4FusedAct kind, cudaStream_t stream) {
+  TensorWrapper workspace_nvte;
+  const NVTETensor act_in = act_input != nullptr ? act_input->data() : nullptr;
+  const NVTETensor out = output != nullptr ? output->data() : nullptr;
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_act_bf16(input.data(), act_in, out, dbias.data(), workspace_nvte.data(), kind,
+                        stream);
+  });
+  at::Tensor workspace_torch;
+  if (workspace_nvte.ndim() > 0 && workspace_nvte.numel() > 0) {
+    workspace_torch = allocateSpace(workspace_nvte.shape(), workspace_nvte.dtype());
+    workspace_nvte = makeTransformerEngineTensor(workspace_torch.data_ptr(), workspace_nvte.shape(),
+                                                 workspace_nvte.dtype());
+  }
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_act_bf16(input.data(), act_in, out, dbias.data(), workspace_nvte.data(), kind,
+                        stream);
+  });
+}
+
 void sum_bias_grad(at::Tensor &bias, const at::Tensor &input) {
   if (input.dim() == 1) {
     bias.copy_(input);
@@ -119,7 +141,13 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
 
   // Apply unfused impl if fused kernel is not supported
   if (!with_fused_kernel) {
-    sum_bias_grad(grad_bias_torch, grad_output_torch);
+    if (detail::IsNVFP4Quantizers(quantizer.ptr()) &&
+        grad_output_torch.scalar_type() == at::kBFloat16 && shape.back() % 8 == 0) {
+      act_bf16_dbias(grad_output_nvte, nullptr, nullptr, grad_bias_nvte, kNVTENVFP4FusedActNone,
+                     at::cuda::getCurrentCUDAStream());
+    } else {
+      sum_bias_grad(grad_bias_torch, grad_output_torch);
+    }
     quantizer_cpp->quantize(grad_output_nvte, grad_input_nvte);
     return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
   }
@@ -225,11 +253,18 @@ std::vector<py::object> dact_dbias(
       {
         auto [temp_nvte, temp_py] =
             NoneQuantizer(py::none()).create_tensor(input_shape, grad_output_dtype);
-        NVTE_SCOPED_GIL_RELEASE({
-          dact_func(grad_output_nvte.data(), act_input_nvte.data(), temp_nvte.data(), stream);
-        });
-        const auto temp_torch = temp_py.cast<at::Tensor>();
-        sum_bias_grad(grad_bias_torch, temp_torch);
+        if (fused_kind != kNVTENVFP4FusedActNone && detail::IsNVFP4Quantizers(quantizer_py.ptr()) &&
+            grad_output_torch.scalar_type() == at::kBFloat16 &&
+            act_input_torch.scalar_type() == at::kBFloat16 && input_shape.back() % 8 == 0) {
+          act_bf16_dbias(grad_output_nvte, &act_input_nvte, &temp_nvte, grad_bias_nvte, fused_kind,
+                         stream);
+        } else {
+          NVTE_SCOPED_GIL_RELEASE({
+            dact_func(grad_output_nvte.data(), act_input_nvte.data(), temp_nvte.data(), stream);
+          });
+          const auto temp_torch = temp_py.cast<at::Tensor>();
+          sum_bias_grad(grad_bias_torch, temp_torch);
+        }
         quantizer_cpp->quantize(temp_nvte, grad_input_nvte);
         break;
       }

@@ -15,6 +15,7 @@
 #include "../util/multi_stream.h"
 #include "../util/math.h"
 #include "../utils.cuh"
+#include "nvfp4/act_bf16.cuh"
 #include "dispatch/dequantize.cuh"
 #include "dispatch/quantize.cuh"
 #include "transformer_engine/transpose.h"
@@ -155,6 +156,80 @@ void nvte_nvfp4_quantize_fused(const NVTETensor input, const NVTETensor act_inpu
   }
 #undef NVTE_NVFP4_FUSED_FWD
 #undef NVTE_NVFP4_FUSED_BWD
+}
+
+void nvte_nvfp4_act_bf16(const NVTETensor input, const NVTETensor act_input, NVTETensor output,
+                         NVTETensor dbias, NVTETensor workspace, NVTENVFP4FusedAct act,
+                         cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_act_bf16);
+  using namespace transformer_engine;
+  const Tensor &in = *convertNVTETensorCheck(input);
+  const Tensor *act_in = act_input != nullptr ? convertNVTETensorCheck(act_input) : nullptr;
+  Tensor *out = output != nullptr ? convertNVTETensor(output) : nullptr;
+  Tensor *db = dbias != nullptr ? convertNVTETensor(dbias) : nullptr;
+  Tensor *ws = workspace != nullptr ? convertNVTETensor(workspace) : nullptr;
+  const bool with_dbias = db != nullptr;
+#define NVTE_NVFP4_ACT_FWD(OP)                                                              \
+  if (with_dbias) {                                                                         \
+    dispatch::nvfp4::act_bf16<true, false, true, Empty, OP<fp32, fp32>>(in, act_in, out, db, ws, \
+                                                                        stream);            \
+  } else {                                                                                  \
+    dispatch::nvfp4::act_bf16<true, false, false, Empty, OP<fp32, fp32>>(in, act_in, out, db, \
+                                                                         ws, stream);       \
+  }
+#define NVTE_NVFP4_ACT_BWD(OP)                                                              \
+  if (with_dbias) {                                                                         \
+    dispatch::nvfp4::act_bf16<false, true, true, Empty, OP<fp32, fp32>>(in, act_in, out, db, ws, \
+                                                                        stream);            \
+  } else {                                                                                  \
+    dispatch::nvfp4::act_bf16<false, true, false, Empty, OP<fp32, fp32>>(in, act_in, out, db, \
+                                                                         ws, stream);       \
+  }
+  switch (act) {
+    case kNVTENVFP4FusedActNone:
+      if (with_dbias) {
+        dispatch::nvfp4::act_bf16<false, false, true, Empty, dispatch::nvfp4::actbf16::identity>(
+            in, act_in, out, db, ws, stream);
+      } else {
+        dispatch::nvfp4::act_bf16<false, false, false, Empty, dispatch::nvfp4::actbf16::identity>(
+            in, act_in, out, db, ws, stream);
+      }
+      break;
+    case kNVTENVFP4FusedActGelu:
+      NVTE_NVFP4_ACT_FWD(gelu);
+      break;
+    case kNVTENVFP4FusedActGeluErf:
+      NVTE_NVFP4_ACT_FWD(gelu_erf);
+      break;
+    case kNVTENVFP4FusedActSilu:
+      NVTE_NVFP4_ACT_FWD(silu);
+      break;
+    case kNVTENVFP4FusedActQGelu:
+      NVTE_NVFP4_ACT_FWD(qgelu);
+      break;
+    case kNVTENVFP4FusedActRelu:
+      NVTE_NVFP4_ACT_FWD(relu);
+      break;
+    case kNVTENVFP4FusedActDGelu:
+      NVTE_NVFP4_ACT_BWD(dgelu);
+      break;
+    case kNVTENVFP4FusedActDGeluErf:
+      NVTE_NVFP4_ACT_BWD(dgelu_erf);
+      break;
+    case kNVTENVFP4FusedActDSilu:
+      NVTE_NVFP4_ACT_BWD(dsilu);
+      break;
+    case kNVTENVFP4FusedActDQGelu:
+      NVTE_NVFP4_ACT_BWD(dqgelu);
+      break;
+    case kNVTENVFP4FusedActDRelu:
+      NVTE_NVFP4_ACT_BWD(drelu);
+      break;
+    default:
+      NVTE_ERROR("Unsupported NVFP4 activation (", static_cast<int>(act), ")");
+  }
+#undef NVTE_NVFP4_ACT_FWD
+#undef NVTE_NVFP4_ACT_BWD
 }
 
 void nvte_nvfp4_carry_amax(NVTETensor history, NVTETensor fresh, NVTETensor step, float margin,
