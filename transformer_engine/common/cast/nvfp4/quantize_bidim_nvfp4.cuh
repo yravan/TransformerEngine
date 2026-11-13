@@ -73,7 +73,9 @@ void quantize_bidim(const Tensor &input, const Tensor *act_input, Tensor *output
   float *const amax_out_ptr = reinterpret_cast<float *>(amax_out.data.dptr);
 
   const size_t *rng_state = nullptr;
-  if (config.stochastic_rounding) {
+  const size_t rng_seed_v = config.rng_by_value ? config.rng_seed_offset[0] : 0;
+  const size_t rng_offset_v = config.rng_by_value ? config.rng_seed_offset[1] : 0;
+  if (config.stochastic_rounding && !config.rng_by_value) {
     NVTE_CHECK(config.rng_state != nullptr, "Stochastic rounding needs an RNG state.");
     const Tensor &rng = *convertNVTETensorCheck(config.rng_state);
     NVTE_CHECK(rng.dtype() == DType::kInt64 && rng.data.shape == Shape{2},
@@ -96,7 +98,8 @@ void quantize_bidim(const Tensor &input, const Tensor *act_input, Tensor *output
               output->columnwise_scale_inv.dptr,
               reinterpret_cast<const float *>(output->amax.dptr),
               reinterpret_cast<const float *>(output->columnwise_amax.dptr), amax_out_ptr,
-              amax_out_ptr + 1, workspace_ptr, rng_state, sign_mask, static_cast<int>(rows),
+              amax_out_ptr + 1, workspace_ptr, rng_state, rng_seed_v, rng_offset_v, sign_mask,
+              static_cast<int>(rows),
               static_cast<int>(cols), scale_stride_rowwise, scale_stride_colwise,
               config.use_fast_math, stream);));
   if constexpr (IS_DBIAS) {

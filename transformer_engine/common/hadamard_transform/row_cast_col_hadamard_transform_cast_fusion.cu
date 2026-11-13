@@ -192,6 +192,8 @@ __global__ static void row_col_rht_gemm_device(
     float* a_amax_out,
     float* c_amax_out,
     const size_t* rng_state,
+    size_t const rng_seed_v,
+    size_t const rng_offset_v,
     int const k_tile_max_arg,
     uint32_t const tiles_in_m_arg,
     uint32_t const tiles_in_n_arg) {
@@ -696,8 +698,8 @@ __global__ static void row_col_rht_gemm_device(
       size_t rng_seed = 0;
       size_t rng_offset = 0;
       if constexpr (kEnableStochasticRounding) {
-        rng_seed = rng_state != nullptr ? __ldg(rng_state) : 0;
-        rng_offset = rng_state != nullptr ? __ldg(rng_state + 1) : 0;
+        rng_seed = rng_state != nullptr ? __ldg(rng_state) : rng_seed_v;
+        rng_offset = rng_state != nullptr ? __ldg(rng_state + 1) : rng_offset_v;
       }
 
       cute::Tensor mD = make_tensor(
@@ -924,8 +926,8 @@ __global__ static void row_col_rht_gemm_device(
       size_t rng_seed = 0;
       size_t rng_offset = 0;
       if constexpr (kEnableStochasticRounding) {
-        rng_seed = rng_state != nullptr ? __ldg(rng_state) : 0;
-        rng_offset = rng_state != nullptr ? __ldg(rng_state + 1) : 0;
+        rng_seed = rng_state != nullptr ? __ldg(rng_state) : rng_seed_v;
+        rng_offset = rng_state != nullptr ? __ldg(rng_state + 1) : rng_offset_v;
       }
       cute::Tensor mQA = make_tensor(cute::subbyte_iterator<TQA>(QA), make_layout(make_shape(M, N), dQA));
       cute::Tensor gQA_mn = local_tile(mQA, epilogue_tiler, make_coord(_,_, _), Step<_1,X,_1>{});
@@ -1099,6 +1101,8 @@ void row_col_rht_gemm_ntt_w_sfc(
     float* a_amax_out,
     float* d_amax_out,
     const size_t* rng_state,
+    size_t rng_seed_v,
+    size_t rng_offset_v,
     uint32_t sm_count,
     cudaStream_t stream,
     int k_tile_size = 1024) {
@@ -1282,7 +1286,7 @@ void row_col_rht_gemm_ntt_w_sfc(
      tensorSFD.data(), sfd_layout,
      tensorQA.data(), dQA,
      tensorSFA.data(), sfa_layout,
-     mma, a_global_amax, d_global_amax, a_amax_out, d_amax_out, rng_state, k_tile_max, tiles_in_m, sched_tiles_in_n);
+     mma, a_global_amax, d_global_amax, a_amax_out, d_amax_out, rng_state, rng_seed_v, rng_offset_v, k_tile_max, tiles_in_m, sched_tiles_in_n);
 
   NVTE_CHECK_CUDA(cudaGetLastError());
   NVTE_CHECK(status == cutlass::Status::kSuccess, "Kernel launch failed.");
@@ -1450,7 +1454,10 @@ void hadamard_transform_cast_fusion(const Tensor &input_, Tensor &output_,
                                 /*d_global_amax=*/
                                 reinterpret_cast<float const *>(columnwise_amax_ptr),
                                 /*a_amax_out=*/amax_out, /*d_amax_out=*/amax_out ? amax_out + 1 : nullptr,
-                                /*rng_state=*/rng_state, /*sm_count=*/sm_count,
+                                /*rng_state=*/rng_state,
+                                /*rng_seed_v=*/quant_config.rng_by_value ? quant_config.rng_seed_offset[0] : 0,
+                                /*rng_offset_v=*/quant_config.rng_by_value ? quant_config.rng_seed_offset[1] : 0,
+                                /*sm_count=*/sm_count,
                                 /*stream=*/stream, /*k_tile_size=*/k_tile_size);
                           } else {
                             NVTE_ERROR("Invalid kernel configuration (kEnableRHTColQuant=",

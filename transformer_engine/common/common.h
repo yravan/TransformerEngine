@@ -652,6 +652,8 @@ struct QuantizationConfig {
   bool mxfp8_2d_quantization = false;
   NVTETensor nvfp4_amax_out = nullptr;
   int32_t nvfp4_rht_sign_mask = 0;
+  uint64_t rng_seed_offset[2] = {0, 0};
+  bool rng_by_value = false;
 
   static constexpr size_t attr_sizes[] = {
       sizeof(uint8_t),                       // force_pow_2_scales
@@ -666,7 +668,8 @@ struct QuantizationConfig {
       sizeof(uint8_t),                       // nvfp4_4over6_err_use_fast_math
       sizeof(uint8_t),                       // mxfp8_2d_quantization
       sizeof(NVTETensor),                    // nvfp4_amax_out
-      sizeof(int32_t)                        // nvfp4_rht_sign_mask
+      sizeof(int32_t),                       // nvfp4_rht_sign_mask
+      2 * sizeof(uint64_t)                   // rng_seed_offset
   };
 };
 

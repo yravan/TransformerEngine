@@ -1219,6 +1219,10 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
     case kNVTEQuantizationConfigNVFP4RHTSignMask:
       std::memcpy(&config_.nvfp4_rht_sign_mask, buf, attr_size);
       break;
+    case kNVTEQuantizationConfigRNGSeedOffset:
+      std::memcpy(config_.rng_seed_offset, buf, attr_size);
+      config_.rng_by_value = true;
+      break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
   }

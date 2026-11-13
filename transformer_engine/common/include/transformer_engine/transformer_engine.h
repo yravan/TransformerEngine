@@ -443,6 +443,9 @@ enum NVTEQuantizationConfigAttribute {
   kNVTEQuantizationConfigNVFP4AmaxOut = 11,
   /*! Random sign mask (16 bits) of the columnwise RHT for the NVFP4 fused single-pass cast. */
   kNVTEQuantizationConfigNVFP4RHTSignMask = 12,
+  /*! Stochastic rounding seed and offset passed by value (2 x uint64) instead of through the
+   *  RNG state tensor; honoured by the NVFP4 fused single-pass cast kernels. */
+  kNVTEQuantizationConfigRNGSeedOffset = 13,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1503,6 +1506,13 @@ class QuantizationConfigWrapper {
   void set_rng_state(NVTETensor rng_state) {
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigRNGState, &rng_state,
                                            sizeof(NVTETensor));
+  }
+
+  /*! \brief Set the stochastic rounding seed and offset by value */
+  void set_rng_seed_offset(uint64_t seed, uint64_t offset) {
+    const uint64_t v[2] = {seed, offset};
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigRNGSeedOffset, v,
+                                           sizeof(v));
   }
 
   /*! \brief Set the fresh-amax output of the NVFP4 fused single-pass cast */

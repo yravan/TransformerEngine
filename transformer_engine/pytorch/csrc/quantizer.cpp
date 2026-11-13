@@ -2784,9 +2784,21 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
   // 3. Columnwise usage is enabled
   // 4. Rowwise and columnwise quantization are not fused,
   //    because within a single kernel we can generate two different random numbers for rowwise and columnwise
+  // Carried global amax (see prepare_fused_cast) and the kernel it runs through.
+  const bool carried_cast = compute_amax && this->delayed_amax &&
+                            input.dtype() == DType::kBFloat16 && this->with_rht &&
+                            this->with_post_rht_amax && !row_scaled_nvfp4 &&
+                            !this->disable_second_level_scale && this->rowwise_usage &&
+                            this->columnwise_usage;
+  const bool bidim_path = carried_cast &&
+                          (use_bidim_kernel() || !eligible_for_rht_cast_fusion) &&
+                          this->fused_cast_eligible(convertShape(input.shape()));
+  // The fused single-pass kernels take the philox seed/offset as kernel arguments, so a
+  // non-captured cast needs neither the 2-element device buffer nor the kernel that fills it.
+  const bool rng_by_value = this->with_rht && (eligible_for_rht_cast_fusion || bidim_path);
   const bool need_separate_columnwise_rng = this->stochastic_rounding && this->with_rht &&
                                             this->columnwise_usage &&
-                                            (!eligible_for_rht_cast_fusion);
+                                            (!eligible_for_rht_cast_fusion) && !bidim_path;
 
   if (this->stochastic_rounding) {
     const size_t rng_elts_per_thread = 1024;  // Wild guess, probably can be tightened
@@ -2796,10 +2808,14 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
 
     // Generate RNG state for rowwise quantization
     at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
-    rng_state = torch::empty({2}, opts);
-    philox_unpack(philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
-    te_rng_state = makeTransformerEngineTensor(rng_state);
-    quant_config.set_rng_state(te_rng_state.data());
+    if (rng_by_value && !philox_args.captured_) {
+      quant_config.set_rng_seed_offset(philox_args.seed_.val, philox_args.offset_.val);
+    } else {
+      rng_state = torch::empty({2}, opts);
+      philox_unpack(philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
+      te_rng_state = makeTransformerEngineTensor(rng_state);
+      quant_config.set_rng_state(te_rng_state.data());
+    }
 
     // Generate separate RNG state for columnwise quantization
     if (need_separate_columnwise_rng) {
@@ -2818,13 +2834,10 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
   std::vector<TensorWrapper> keepalive;
   std::vector<at::Tensor> keepalive_torch;
   bool skip_amax = false;
-  if (compute_amax && this->delayed_amax && input.dtype() == DType::kBFloat16 && this->with_rht &&
-      this->with_post_rht_amax && !row_scaled_nvfp4 && !this->disable_second_level_scale &&
-      this->rowwise_usage && this->columnwise_usage) {
+  if (carried_cast) {
     // The register kernel takes the shapes the RHT cast fusion cannot (cols % 128 != 0, e.g. the
     // 1856-wide backbone tensors, which otherwise run the unfused RHT + amax + cast path).
-    if ((use_bidim_kernel() || !eligible_for_rht_cast_fusion) &&
-        this->fused_cast_eligible(convertShape(input.shape()))) {
+    if (bidim_path) {
       this->prepare_fused_cast(input, out, quant_config, keepalive, keepalive_torch);
       NVTE_SCOPED_GIL_RELEASE(
           { nvte_quantize_v2(input.data(), out.data(), quant_config, stream); });

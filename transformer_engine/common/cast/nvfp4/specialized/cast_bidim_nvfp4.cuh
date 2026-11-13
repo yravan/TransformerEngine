@@ -130,11 +130,12 @@ struct Rng {
   transformer_engine::curanddx::detail::philox4x32_native_state<NVTE_BUILD_NUM_PHILOX_ROUNDS> state;
   uint4 buf;
   int idx;
-  __device__ __forceinline__ void init(const size_t *rng_state, const size_t seq_base) {
+  __device__ __forceinline__ void init(const size_t *rng_state, const size_t seed_v,
+                                       const size_t offset_v, const size_t seq_base) {
     const size_t sequence = threadIdx.x + blockIdx.x * kThreadsPerCta +
                             blockIdx.y * gridDim.x * kThreadsPerCta + seq_base;
-    state.init(rng_state != nullptr ? rng_state[0] : 0, sequence,
-               rng_state != nullptr ? rng_state[1] : 0);
+    state.init(rng_state != nullptr ? rng_state[0] : seed_v, sequence,
+               rng_state != nullptr ? rng_state[1] : offset_v);
     buf = state.generate4();
     idx = 0;
   }
@@ -162,7 +163,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
     const float *__restrict__ amax_rowwise_in, const float *__restrict__ amax_colwise_in,
     float *__restrict__ amax_rowwise_out, float *__restrict__ amax_colwise_out,
     float *__restrict__ dbias_workspace, const size_t *__restrict__ rng_state,
-    const uint32_t sign_mask, const int32_t rows, const int32_t cols, const int32_t col_base,
+    const size_t rng_seed_v, const size_t rng_offset_v, const uint32_t sign_mask, const int32_t rows, const int32_t cols, const int32_t col_base,
     const int32_t scale_stride_rowwise, const int32_t scale_stride_colwise, const bool fast_math) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr int32_t kWords = COLS_PER_LANE / kElemsPerWord;
@@ -207,7 +208,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
 
   Rng rng;
   if constexpr (SR) {
-    rng.init(rng_state, static_cast<size_t>(col_base) * rows);
+    rng.init(rng_state, rng_seed_v, rng_offset_v, static_cast<size_t>(col_base) * rows);
   }
 
   if constexpr (IS_ACT || IS_DACT || IS_DBIAS) {
@@ -429,7 +430,8 @@ inline void launch_cast_bidim_nvfp4_cpl(const void *input, const void *act_input
                                         const float *amax_rowwise_in,
                                         const float *amax_colwise_in, float *amax_rowwise_out,
                                         float *amax_colwise_out, float *dbias_workspace,
-                                        const size_t *rng_state, uint32_t sign_mask, int rows,
+                                        const size_t *rng_state, size_t rng_seed_v,
+                                        size_t rng_offset_v, uint32_t sign_mask, int rows,
                                         int cols, int col_base, int chunk_cols,
                                         int scale_stride_rowwise, int scale_stride_colwise,
                                         bool fast_math, cudaStream_t stream) {
@@ -445,8 +447,8 @@ inline void launch_cast_bidim_nvfp4_cpl(const void *input, const void *act_input
       reinterpret_cast<uint8_t *>(out_rowwise), reinterpret_cast<uint8_t *>(scales_rowwise),
       reinterpret_cast<uint8_t *>(out_colwise), reinterpret_cast<uint8_t *>(scales_colwise),
       amax_rowwise_in, amax_colwise_in, amax_rowwise_out, amax_colwise_out, dbias_workspace,
-      rng_state, sign_mask, rows, cols, col_base, scale_stride_rowwise, scale_stride_colwise,
-      fast_math);
+      rng_state, rng_seed_v, rng_offset_v, sign_mask, rows, cols, col_base, scale_stride_rowwise,
+      scale_stride_colwise, fast_math);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
@@ -462,6 +464,7 @@ inline void launch_cast_bidim_nvfp4(const void *input, const void *act_input, vo
                                     const float *amax_rowwise_in, const float *amax_colwise_in,
                                     float *amax_rowwise_out, float *amax_colwise_out,
                                     float *dbias_workspace, const size_t *rng_state,
+                                    size_t rng_seed_v, size_t rng_offset_v,
                                     uint32_t sign_mask, int rows, int cols,
                                     int scale_stride_rowwise, int scale_stride_colwise,
                                     bool fast_math, cudaStream_t stream) {
@@ -471,7 +474,7 @@ inline void launch_cast_bidim_nvfp4(const void *input, const void *act_input, vo
 #define NVTE_NVFP4_BIDIM_ARGS(base, chunk)                                                     \
   input, act_input, out_rowwise, scales_rowwise, out_colwise, scales_colwise, amax_rowwise_in,  \
       amax_colwise_in, amax_rowwise_out, amax_colwise_out, dbias_workspace, rng_state,          \
-      sign_mask, rows, cols, base, chunk, scale_stride_rowwise, scale_stride_colwise, fast_math, \
+      rng_seed_v, rng_offset_v, sign_mask, rows, cols, base, chunk, scale_stride_rowwise, scale_stride_colwise, fast_math, \
       stream
   // The widest tile over as many columns as it covers, then one launch per narrower tail, so a
   // 1856-wide tensor runs 1792 columns at the 256-column rate and only 64 at the 64-column one.
