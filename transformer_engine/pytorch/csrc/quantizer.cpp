@@ -2828,7 +2828,10 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
   if (compute_amax && this->delayed_amax && input.dtype() == DType::kBFloat16 && this->with_rht &&
       this->with_post_rht_amax && !row_scaled_nvfp4 && !this->disable_second_level_scale &&
       this->rowwise_usage && this->columnwise_usage) {
-    if (use_bidim_kernel() && this->fused_cast_eligible(convertShape(input.shape()))) {
+    // The register kernel takes the shapes the RHT cast fusion cannot (cols % 128 != 0, e.g. the
+    // 1856-wide backbone tensors, which otherwise run the unfused RHT + amax + cast path).
+    if ((use_bidim_kernel() || !eligible_for_rht_cast_fusion) &&
+        this->fused_cast_eligible(convertShape(input.shape()))) {
       QuantizationConfigWrapper fused_config;
       if (noop_flag) fused_config.set_noop_tensor(noop_flag->data());
       this->prepare_fused_cast(input, out, fused_config, keepalive, keepalive_torch);

@@ -129,9 +129,9 @@ struct Rng {
   transformer_engine::curanddx::detail::philox4x32_native_state<NVTE_BUILD_NUM_PHILOX_ROUNDS> state;
   uint4 buf;
   int idx;
-  __device__ __forceinline__ void init(const size_t *rng_state) {
-    const size_t sequence =
-        threadIdx.x + blockIdx.x * kThreadsPerCta + blockIdx.y * gridDim.x * kThreadsPerCta;
+  __device__ __forceinline__ void init(const size_t *rng_state, const size_t seq_base) {
+    const size_t sequence = threadIdx.x + blockIdx.x * kThreadsPerCta +
+                            blockIdx.y * gridDim.x * kThreadsPerCta + seq_base;
     state.init(rng_state != nullptr ? rng_state[0] : 0, sequence,
                rng_state != nullptr ? rng_state[1] : 0);
     buf = state.generate4();
@@ -161,7 +161,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
     const float *__restrict__ amax_rowwise_in, const float *__restrict__ amax_colwise_in,
     float *__restrict__ amax_rowwise_out, float *__restrict__ amax_colwise_out,
     float *__restrict__ dbias_workspace, const size_t *__restrict__ rng_state,
-    const uint32_t sign_mask, const int32_t rows, const int32_t cols,
+    const uint32_t sign_mask, const int32_t rows, const int32_t cols, const int32_t col_base,
     const int32_t scale_stride_rowwise, const int32_t scale_stride_colwise, const bool fast_math) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr int32_t kWords = COLS_PER_LANE / kElemsPerWord;
@@ -180,7 +180,9 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
   const int32_t warp = tid / THREADS_PER_WARP;
   const int32_t lane = tid % THREADS_PER_WARP;
   const int32_t row0 = blockIdx.y * kRowsPerCta + warp * kRowsPerLane;
-  const int32_t col0 = blockIdx.x * kColsPerCta + lane * COLS_PER_LANE;
+  // The launch covers columns [col_base, col_base + gridDim.x * kColsPerCta) of a `cols`-wide tensor.
+  const int32_t cta_col0 = col_base + blockIdx.x * kColsPerCta;
+  const int32_t col0 = cta_col0 + lane * COLS_PER_LANE;
   const int32_t row_block = blockIdx.y * kWarpsPerCta + warp;
 
   const uint64_t policy = ptx::create_l2_policy_evict_last();
@@ -204,7 +206,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
 
   Rng rng;
   if constexpr (SR) {
-    rng.init(rng_state);
+    rng.init(rng_state, static_cast<size_t>(col_base) * rows);
   }
 
   if constexpr (IS_ACT || IS_DACT || IS_DBIAS) {
@@ -396,7 +398,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
       float sum = s_dbias[0][c];
 #pragma unroll
       for (int32_t w = 1; w < kWarpsPerCta; ++w) sum += s_dbias[w][c];
-      dbias_workspace[static_cast<size_t>(blockIdx.y) * cols + blockIdx.x * kColsPerCta + c] = sum;
+      dbias_workspace[static_cast<size_t>(blockIdx.y) * cols + cta_col0 + c] = sum;
     }
   }
   // Each column of the CTA is 32 contiguous bytes of the transposed output.
@@ -405,7 +407,7 @@ __global__ __launch_bounds__(kThreadsPerCta, MIN_BLOCKS_PER_SM) void cast_bidim_
   for (int32_t j = 0; j < kColsPerThread; ++j) {
     const int32_t c = tid * kColsPerThread + j;
     if (kColsPerCta % kThreadsPerCta == 0 || c < kColsPerCta) {
-      uint8_t *dst = out_colwise + (static_cast<size_t>(blockIdx.x * kColsPerCta + c) * rows +
+      uint8_t *dst = out_colwise + (static_cast<size_t>(cta_col0 + c) * rows +
                                     static_cast<size_t>(blockIdx.y) * kRowsPerCta) / 2;
       uint32_t w[8];
 #pragma unroll
@@ -427,22 +429,23 @@ inline void launch_cast_bidim_nvfp4_cpl(const void *input, const void *act_input
                                         const float *amax_colwise_in, float *amax_rowwise_out,
                                         float *amax_colwise_out, float *dbias_workspace,
                                         const size_t *rng_state, uint32_t sign_mask, int rows,
-                                        int cols, int scale_stride_rowwise,
-                                        int scale_stride_colwise, bool fast_math,
-                                        cudaStream_t stream) {
+                                        int cols, int col_base, int chunk_cols,
+                                        int scale_stride_rowwise, int scale_stride_colwise,
+                                        bool fast_math, cudaStream_t stream) {
   constexpr int32_t kColsPerCta = THREADS_PER_WARP * COLS_PER_LANE;
   NVTE_CHECK(rows % kRowsPerCta == 0, "NVFP4 bidim cast needs rows (", rows, ") % ", kRowsPerCta,
              " == 0.");
-  NVTE_CHECK(cols % kColsPerCta == 0, "NVFP4 bidim cast needs cols (", cols, ") % ", kColsPerCta,
-             " == 0.");
-  const dim3 grid(cols / kColsPerCta, rows / kRowsPerCta);
+  NVTE_CHECK(chunk_cols % kColsPerCta == 0, "NVFP4 bidim cast chunk (", chunk_cols, ") % ",
+             kColsPerCta, " == 0.");
+  const dim3 grid(chunk_cols / kColsPerCta, rows / kRowsPerCta);
   cast_bidim_nvfp4_kernel<COLS_PER_LANE, MIN_BLOCKS_PER_SM, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
                           IS_ACT, ParamOP, OP><<<grid, kThreadsPerCta, 0, stream>>>(
       reinterpret_cast<const uint8_t *>(input), reinterpret_cast<const uint8_t *>(act_input),
       reinterpret_cast<uint8_t *>(out_rowwise), reinterpret_cast<uint8_t *>(scales_rowwise),
       reinterpret_cast<uint8_t *>(out_colwise), reinterpret_cast<uint8_t *>(scales_colwise),
       amax_rowwise_in, amax_colwise_in, amax_rowwise_out, amax_colwise_out, dbias_workspace,
-      rng_state, sign_mask, rows, cols, scale_stride_rowwise, scale_stride_colwise, fast_math);
+      rng_state, sign_mask, rows, cols, col_base, scale_stride_rowwise, scale_stride_colwise,
+      fast_math);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
@@ -464,20 +467,31 @@ inline void launch_cast_bidim_nvfp4(const void *input, const void *act_input, vo
   NVTE_CHECK(rows % kRowsPerCta == 0, "NVFP4 bidim cast needs rows (", rows, ") % ", kRowsPerCta,
              " == 0.");
   NVTE_CHECK(cols % 64 == 0, "NVFP4 bidim cast needs cols (", cols, ") % 64 == 0.");
-#define NVTE_NVFP4_BIDIM_ARGS                                                                   \
+#define NVTE_NVFP4_BIDIM_ARGS(base, chunk)                                                     \
   input, act_input, out_rowwise, scales_rowwise, out_colwise, scales_colwise, amax_rowwise_in,  \
       amax_colwise_in, amax_rowwise_out, amax_colwise_out, dbias_workspace, rng_state,          \
-      sign_mask, rows, cols, scale_stride_rowwise, scale_stride_colwise, fast_math, stream
-  if (cols % 256 == 0) {
+      sign_mask, rows, cols, base, chunk, scale_stride_rowwise, scale_stride_colwise, fast_math, \
+      stream
+  // The widest tile over as many columns as it covers, then one launch per narrower tail, so a
+  // 1856-wide tensor runs 1792 columns at the 256-column rate and only 64 at the 64-column one.
+  int base = 0;
+  const int wide = cols / 256 * 256;
+  if (wide > 0) {
     launch_cast_bidim_nvfp4_cpl<8, kWideMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
-                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS);
-  } else if (cols % 128 == 0) {
-    launch_cast_bidim_nvfp4_cpl<4, kMidMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
-                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS);
-  } else {
-    launch_cast_bidim_nvfp4_cpl<2, kNarrowMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
-                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS);
+                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, wide));
+    base += wide;
   }
+  if (cols - base >= 128) {
+    launch_cast_bidim_nvfp4_cpl<4, kMidMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
+                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, 128));
+    base += 128;
+  }
+  if (cols - base == 64) {
+    launch_cast_bidim_nvfp4_cpl<2, kNarrowMinBlocksPerSm, SWIZZLED_SCALES, SR, IS_DBIAS, IS_DACT,
+                                IS_ACT, ParamOP, OP>(NVTE_NVFP4_BIDIM_ARGS(base, 64));
+    base += 64;
+  }
+  NVTE_CHECK(base == cols, "NVFP4 bidim cast covered ", base, " of ", cols, " columns.");
 #undef NVTE_NVFP4_BIDIM_ARGS
 }
 
