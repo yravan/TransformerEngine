@@ -80,7 +80,10 @@ def test_plain_cast_matches_reference(shape, stochastic_rounding):
     else:
         assert torch.equal(y._rowwise_data, y_ref._rowwise_data)
     cdq, cdq_ref = _col_dq(y), _col_dq(y_ref)
-    scales_equal = (y._columnwise_scale_inv == y_ref._columnwise_scale_inv).float().mean()
+    # The scale tensors are padded; the padding is never written and differs between runs.
+    c, half = y._columnwise_data.shape
+    valid = (slice(0, c), slice(0, half * 2 // 16))
+    scales_equal = (y._columnwise_scale_inv[valid] == y_ref._columnwise_scale_inv[valid]).float().mean()
     assert scales_equal > 0.999
     diff = (cdq - cdq_ref).abs()
     assert (diff <= (2 if stochastic_rounding else 1) * _block_step(cdq_ref) + 1e-6).all()
