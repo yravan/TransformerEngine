@@ -5,7 +5,6 @@
 """Tensor class with NVFP4 data"""
 from __future__ import annotations
 from collections.abc import Iterable
-import itertools
 import math
 import warnings
 from typing import Any, Dict, Optional, Tuple, Union
@@ -113,7 +112,6 @@ def get_random_sign_mask_for_rht(with_random_sign_mask: bool, device: int) -> in
     return 0
 
 
-_AMAX_STATE_IDS = itertools.count(1)
 
 
 class NVFP4Quantizer(Quantizer):
@@ -172,16 +170,10 @@ class NVFP4Quantizer(Quantizer):
         disable_second_level_scale: bool = False,
         delayed_amax: bool = False,
         amax_margin: float = 1.25,
-        amax_state_id: Optional[str] = None,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.delayed_amax = delayed_amax
         self.amax_margin = float(amax_margin)
-        # Identifies this quantizer's carried-amax state (a registry in the C++ extension). Not a
-        # value field: baking it into the torch.compile constant would give every layer its own
-        # graph. A copy keeps the id; a quantizer rebuilt from its value gets one in
-        # ``_rebuild_derived_state`` (a string, so torch.compile never makes it symbolic).
-        self._amax_state_id = str(next(_AMAX_STATE_IDS)) if amax_state_id is None else str(amax_state_id)
         self.dtype = DType.cast(fp4_dtype)
         self.scale_dtype = DType.cast(scale_dtype)
         if self.scale_dtype not in (DType.kFloat8E4M3, DType.kFloat8UE5M3):
@@ -234,8 +226,12 @@ class NVFP4Quantizer(Quantizer):
         self.rht_matrix = get_rht_matrix(
             self.rht_matrix_random_sign_mask_t != 0, torch.cuda.current_device()
         )
-        if not hasattr(self, "_amax_state_id"):
-            self._amax_state_id = str(next(_AMAX_STATE_IDS))
+        # The carried-amax state (a registry in the C++ extension) is keyed by the quantizer's
+        # value: torch.compile rebuilds a value-opaque quantizer on every graph run, so nothing
+        # per object survives, and a per-quantizer value field would give every layer its own
+        # graph. Quantizers of one config therefore share one state (their casts' amaxes over a
+        # whole step), in eager and compiled runs alike.
+        self._amax_state_id = repr(self._value_key()[1])
 
     def update_quantized(
         self,
@@ -289,7 +285,6 @@ class NVFP4Quantizer(Quantizer):
             disable_second_level_scale=self.disable_second_level_scale,
             delayed_amax=self.delayed_amax,
             amax_margin=self.amax_margin,
-            amax_state_id=self._amax_state_id,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm

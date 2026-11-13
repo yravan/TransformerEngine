@@ -178,6 +178,8 @@ void init_router_bindings(pybind11::module &m) {
 }
 
 void bind_quantize_with_amax_extensions(py::module_ &m) {
+  m.def("nvfp4_reset_amax_states", &transformer_engine::pytorch::nvfp4_reset_amax_states,
+        "Drop every carried-amax state (the next cast of each quantizer config is exact).");
   m.def("nvfp4_quantize_with_amax", nvfp4_quantize_with_amax, py::arg("tensor"),
         py::arg("quantizer"), py::arg("rowwise_amax"), py::arg("columnwise_amax"));
   m.def("nvfp4_group_quantize_with_amax", nvfp4_group_quantize_with_amax, py::arg("tensor"),

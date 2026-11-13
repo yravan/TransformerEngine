@@ -8,6 +8,7 @@
 #include <pybind.h>
 
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #include "common.h"
@@ -1925,7 +1926,7 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
   if (py::hasattr(quantizer, "delayed_amax") && quantizer.attr("delayed_amax").cast<bool>()) {
     this->delayed_amax = true;
     this->amax_margin = quantizer.attr("amax_margin").cast<float>();
-    this->amax_state_id = std::stoi(quantizer.attr("_amax_state_id").cast<std::string>());
+    this->amax_state_id = quantizer.attr("_amax_state_id").cast<std::string>();
   }
 }
 
@@ -1936,13 +1937,22 @@ struct NVFP4AmaxState {
   bool warm = false;
 };
 
-constexpr int64_t kAmaxHistoryLen = 16;
+constexpr int64_t kAmaxHistoryLen = 256;
 
-NVFP4AmaxState& nvfp4_amax_state(int id) {
+std::mutex& nvfp4_amax_registry_mutex() {
   static std::mutex mutex;
-  static std::unordered_map<int64_t, NVFP4AmaxState> registry;
-  const int64_t key = static_cast<int64_t>(id) * 64 + at::cuda::current_device();
-  std::lock_guard<std::mutex> lock(mutex);
+  return mutex;
+}
+
+std::unordered_map<std::string, NVFP4AmaxState>& nvfp4_amax_registry() {
+  static std::unordered_map<std::string, NVFP4AmaxState> registry;
+  return registry;
+}
+
+NVFP4AmaxState& nvfp4_amax_state(const std::string& id) {
+  const std::string key = id + "@" + std::to_string(at::cuda::current_device());
+  std::lock_guard<std::mutex> lock(nvfp4_amax_registry_mutex());
+  auto& registry = nvfp4_amax_registry();
   auto it = registry.find(key);
   if (it == registry.end()) {
     const auto f32 = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
@@ -1957,6 +1967,11 @@ NVFP4AmaxState& nvfp4_amax_state(int id) {
 }
 
 }  // namespace
+
+void nvfp4_reset_amax_states() {
+  std::lock_guard<std::mutex> lock(nvfp4_amax_registry_mutex());
+  nvfp4_amax_registry().clear();
+}
 
 bool NVFP4Quantizer::use_bidim_kernel() {
   static const bool v = transformer_engine::getenv<bool>("NVTE_NVFP4_BIDIM");

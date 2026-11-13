@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _quantizers(stochastic_rounding: bool, margin: float = 1.0):
+    tex.nvfp4_reset_amax_states()
     kwargs = dict(
         with_rht=True,
         with_post_rht_amax=True,
@@ -31,7 +32,6 @@ def _quantizers(stochastic_rounding: bool, margin: float = 1.0):
     # Same random sign mask, so the RHT is the same transform.
     fused.rht_matrix_random_sign_mask_t = ref.rht_matrix_random_sign_mask_t
     fused._rebuild_derived_state()
-    assert fused._amax_state_id != ref._amax_state_id
     return ref, fused
 
 

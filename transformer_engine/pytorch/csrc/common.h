@@ -339,6 +339,8 @@ class MXFP8Quantizer : public Quantizer {
   std::vector<size_t> get_scale_shape(const std::vector<size_t>& shape, bool columnwise) const;
 };
 
+void nvfp4_reset_amax_states();
+
 class NVFP4Quantizer : public Quantizer {
  public:
   using ShapeAlignment = std::optional<std::pair<size_t, size_t>>;
@@ -371,7 +373,7 @@ class NVFP4Quantizer : public Quantizer {
   // by amax_state_id, so a quantizer rebuilt from its value (torch.compile) finds the same state.
   bool delayed_amax = false;
   float amax_margin = 1.0f;
-  int amax_state_id = 0;
+  std::string amax_state_id;
 
   explicit NVFP4Quantizer(const py::handle& quantizer);
 
