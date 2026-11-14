@@ -110,6 +110,8 @@ __global__ void __launch_bounds__(kThreads, 1)
 
   extern __shared__ __align__(128) char smem_[];
   __shared__ uint64_t mbar[kBuffers];
+  __shared__ __align__(16) float gamma_s[COLS];
+  __shared__ __align__(16) float beta_s[COLS];
   bf16 *const tiles = reinterpret_cast<bf16 *>(smem_);
   e8m0_t *const rowwise_scales = reinterpret_cast<e8m0_t *>(tiles + kBuffers * kTileRows * COLS);
 
@@ -133,16 +135,10 @@ __global__ void __launch_bounds__(kThreads, 1)
     fetch(blockIdx.x, 0);
   }
 
-  Ivec gamma_v[LDGS];
-  Ivec beta_v[LDGS];
-  {
-    int idx = lane;
-#pragma unroll
-    for (int it = 0; it < LDGS; ++it) {
-      gamma_v[it].load_from(gamma, idx);
-      beta_v[it].load_from(beta, idx);
-      idx += THREADS_PER_WARP;
-    }
+  for (int c = tidx; c < COLS; c += kThreads) {
+    const compute_t g = gamma[c];
+    gamma_s[c] = zero_centered_gamma ? g + 1 : g;
+    beta_s[c] = beta[c];
   }
 
   constexpr compute_t rn = 1.f / compute_t(COLS);
@@ -174,58 +170,45 @@ __global__ void __launch_bounds__(kThreads, 1)
 
     // Stats<compute_t, 1, WARPS_M, 1>::compute: the lane's sequential sum, the warp's xor
     // allreduce, then the same for the squared deviations.
-    compute_t m[R];
-    compute_t m2[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-      m[r] = 0.f;
-    }
+    float2 m = make_float2(0.f, 0.f);
 #pragma unroll
     for (int it = 0; it < LDGS; ++it) {
 #pragma unroll
       for (int jt = 0; jt < kEltsPerLdg; ++jt) {
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-          m[r] += compute_t(xv[r][it].data.elt[jt]);
-        }
+        m = __fadd2_rn(m, make_float2(compute_t(xv[0][it].data.elt[jt]),
+                                      compute_t(xv[1][it].data.elt[jt])));
       }
     }
 #pragma unroll
     for (int step = 1; step < THREADS_PER_WARP; step *= 2) {
-#pragma unroll
-      for (int r = 0; r < R; ++r) {
-        m[r] = m[r] + warp_shuffle_xor(m[r], step);
-      }
+      m = __fadd2_rn(m, make_float2(warp_shuffle_xor(m.x, step), warp_shuffle_xor(m.y, step)));
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-      m[r] *= rn;
-      m2[r] = 0.f;
-    }
+    m = __fmul2_rn(m, make_float2(rn, rn));
+    const float2 neg_m = make_float2(-m.x, -m.y);
+    float2 m2 = make_float2(0.f, 0.f);
 #pragma unroll
     for (int it = 0; it < LDGS; ++it) {
 #pragma unroll
       for (int jt = 0; jt < kEltsPerLdg; ++jt) {
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-          const compute_t diff = (compute_t(xv[r][it].data.elt[jt]) - m[r]);
-          m2[r] += diff * diff;
-        }
+        const float2 diff = __fadd2_rn(make_float2(compute_t(xv[0][it].data.elt[jt]),
+                                                   compute_t(xv[1][it].data.elt[jt])),
+                                       neg_m);
+        m2 = __ffma2_rn(diff, diff, m2);
       }
     }
 #pragma unroll
     for (int step = 1; step < THREADS_PER_WARP; step *= 2) {
-#pragma unroll
-      for (int r = 0; r < R; ++r) {
-        m2[r] = m2[r] + warp_shuffle_xor(m2[r], step);
-      }
+      m2 = __fadd2_rn(m2,
+                      make_float2(warp_shuffle_xor(m2.x, step), warp_shuffle_xor(m2.y, step)));
     }
+    const compute_t mean[R] = {m.x, m.y};
+    const compute_t var[R] = {m2.x, m2.y};
     compute_t rs[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-      rs[r] = rsqrtf(rn * m2[r] + epsilon);
+      rs[r] = rsqrtf(rn * var[r] + epsilon);
       if (lane == 0) {
-        mu_out[row_base + warp * R + r] = m[r];
+        mu_out[row_base + warp * R + r] = mean[r];
         rsigma_out[row_base + warp * R + r] = rs[r];
       }
     }
@@ -233,19 +216,30 @@ __global__ void __launch_bounds__(kThreads, 1)
 #pragma unroll
     for (int it = 0; it < LDGS; ++it) {
       const int col = it * kColsPerLdg + lane * kEltsPerLdg;
+      float2 g2[kEltsPerLdg / 2];
+      float2 b2[kEltsPerLdg / 2];
+#pragma unroll
+      for (int p = 0; p < kEltsPerLdg / 4; ++p) {
+        const float4 g4 = reinterpret_cast<const float4 *>(gamma_s + col)[p];
+        const float4 b4 = reinterpret_cast<const float4 *>(beta_s + col)[p];
+        g2[2 * p] = make_float2(g4.x, g4.y);
+        g2[2 * p + 1] = make_float2(g4.z, g4.w);
+        b2[2 * p] = make_float2(b4.x, b4.y);
+        b2[2 * p + 1] = make_float2(b4.z, b4.w);
+      }
       Ivec z[R];
 #pragma unroll
       for (int r = 0; r < R; ++r) {
+        const float2 nm = make_float2(-mean[r], -mean[r]);
+        const float2 rs2 = make_float2(rs[r], rs[r]);
+        __nv_bfloat162 *const z2 = reinterpret_cast<__nv_bfloat162 *>(&z[r]);
 #pragma unroll
-        for (int jt = 0; jt < kEltsPerLdg; ++jt) {
-          const compute_t y_ij = rs[r] * (compute_t(xv[r][it].data.elt[jt]) - m[r]);
-          compute_t g_ij = gamma_v[it].data.elt[jt];
-          if (zero_centered_gamma) {
-            g_ij += 1;
-          }
-          const compute_t b_ij = beta_v[it].data.elt[jt];
-          const compute_t temp_output = g_ij * y_ij + b_ij;
-          z[r].data.elt[jt] = bf16(temp_output);
+        for (int p = 0; p < kEltsPerLdg / 2; ++p) {
+          const float2 diff = __fadd2_rn(make_float2(compute_t(xv[r][it].data.elt[2 * p]),
+                                                     compute_t(xv[r][it].data.elt[2 * p + 1])),
+                                         nm);
+          const float2 y = __fmul2_rn(rs2, diff);
+          z2[p] = __float22bfloat162_rn(__ffma2_rn(g2[p], y, b2[p]));
         }
         z[r].store_to(tile_row[r], col / kEltsPerLdg);
       }
@@ -297,16 +291,18 @@ __global__ void __launch_bounds__(kThreads, 1)
     for (int g = tidx; g < COLS / 2; g += kThreads) {
       const int col = g * 2;
       ptx::bf16x2 v[kTileRows];
-      float amax[2];
 #pragma unroll
       for (int r = 0; r < kTileRows; ++r) {
         v[r] = *reinterpret_cast<const ptx::bf16x2 *>(tile_smem + r * COLS + col);
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-          const float value = fabsf(static_cast<float>(j == 0 ? v[r].x : v[r].y));
-          amax[j] = r == 0 ? value : fmaxf(amax[j], value);
-        }
       }
+      ptx::bf16x2 amax2;
+      ptx::abs_max_2x(amax2, v[0], v[0]);
+#pragma unroll
+      for (int r = 1; r < kTileRows; ++r) {
+        ptx::abs_max_2x(amax2, amax2, v[r]);
+      }
+      const float amax[2] = {fabsf(static_cast<float>(amax2.x)),
+                             fabsf(static_cast<float>(amax2.y))};
       e8m0_t biased_exponents[2];
       float scale_inv[2];
 #pragma unroll

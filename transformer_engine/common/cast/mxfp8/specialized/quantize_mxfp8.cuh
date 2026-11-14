@@ -1342,6 +1342,19 @@ __global__ void quantize_mxfp8_kernel_cast_only(
   if (noop != nullptr && noop[0] == 1.0f) {
     return;
   }
+  if constexpr (CastTraits::_with_swizzled_scales) {
+    using transformer_engine::dispatch::mxfp8::swizzle::zero_gemm_swizzled_scale_padding;
+    const size_t threads = static_cast<size_t>(blockDim.x) * blockDim.y;
+    const size_t worker = (static_cast<size_t>(blockIdx.y) * gridDim.x + blockIdx.x) * threads +
+                          threadIdx.y * blockDim.x + threadIdx.x;
+    const size_t num_workers = static_cast<size_t>(gridDim.x) * gridDim.y * threads;
+    constexpr int32_t row_chunk = CastTraits::rowChunkElems;
+    constexpr int32_t col_chunk = CastTraits::colChunkElems;
+    zero_gemm_swizzled_scale_padding(scales_rowwise, rows, (cols + row_chunk - 1) / row_chunk,
+                                     worker, num_workers);
+    zero_gemm_swizzled_scale_padding(scales_colwise, cols, (rows + col_chunk - 1) / col_chunk,
+                                     worker, num_workers);
+  }
   using IType = typename CastTraits::IType;
   using OType = typename CastTraits::OType;
   using inputUnitType = typename CastTraits::inputUnitType;

@@ -72,6 +72,22 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
       return;
     }
   }
+  if constexpr (WITH_GEMM_SWIZZLED_SCALES) {
+    using transformer_engine::dispatch::mxfp8::swizzle::zero_gemm_swizzled_scale_padding;
+    const size_t worker =
+        (static_cast<size_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t num_workers = static_cast<size_t>(gridDim.x) * gridDim.y * blockDim.x;
+    if constexpr (ROWWISE_SCALING) {
+      zero_gemm_swizzled_scale_padding(scales_rowwise, rows,
+                                       (cols + SCALE_DIM_X - 1) / SCALE_DIM_X, worker,
+                                       num_workers);
+    }
+    if constexpr (COLWISE_SCALING) {
+      zero_gemm_swizzled_scale_padding(scales_colwise, cols,
+                                       (rows + SCALE_DIM_Y - 1) / SCALE_DIM_Y, worker,
+                                       num_workers);
+    }
+  }
   constexpr size_t THREADS_X = CHUNK_DIM_X / SCALE_DIM_X;
   constexpr size_t THREADS_Y = THREADS_PER_CHUNK / THREADS_X;
 
@@ -759,9 +775,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
   const float *const noop_ptr =
       (NO_ACTIVATIONS && !IS_DBIAS) ? reinterpret_cast<const float *>(noop->data.dptr) : nullptr;
 
-  // Clear padding before either the generic or specialized kernel writes
-  // directly into the GEMM-swizzled scale layout.
-  if (with_gemm_swizzled_scales && (cols % 128 != 0 || rows % 128 != 0)) {
+  const auto zero_scale_padding = [&]() {
+    if (!with_gemm_swizzled_scales || (cols % 128 == 0 && rows % 128 == 0)) {
+      return;
+    }
     constexpr size_t zero_threads = 256;
     if (use_rowwise_scaling) {
       const size_t size_bytes = output->scale_inv.buffer_size_bytes();
@@ -781,7 +798,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
         NVTE_CHECK_CUDA(cudaGetLastError());
       }
     }
-  }
+  };
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
       input.dtype(), IType,
@@ -824,6 +841,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
 
               if constexpr (COMPUTE_ACTIVATIONS && std::is_same_v<IType, bf16>) {
                 if (register_resident_activation) {
+                  zero_scale_padding();
                   specialized::launch_cast_bidim<OType, WITH_GEMM_SWIZZLED_SCALES, IS_DBIAS, IS_DACT,
                                                  IS_ACT, ParamOP, OP>(
                       input.data.dptr, IS_DACT ? act_input->data.dptr : nullptr, output->data.dptr,
@@ -847,6 +865,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                   !use_2d_quantization && scaling_type_has_specialized_support) {
                 switch (scaling_type) {
                   case ScalingType::ROWWISE: {
+                    zero_scale_padding();
                     // The register-resident kernel supersedes the staged one below
                     // wherever it applies.
                     // hasSpec has already established cast-only, leaving the input
