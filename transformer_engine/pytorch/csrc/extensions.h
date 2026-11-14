@@ -357,6 +357,11 @@ std::vector<py::object> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
                                       const at::Tensor &gamma, const int sm_margin,
                                       const bool zero_centered_gamma);
 
+std::vector<py::object> layernorm_bwd_add(const at::Tensor &dz, const at::Tensor &x,
+                                          const at::Tensor &add, const at::Tensor &mu,
+                                          const at::Tensor &rsigma, const at::Tensor &gamma,
+                                          const int sm_margin, const bool zero_centered_gamma);
+
 std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, MaybeTensor bias,
                                       float eps, py::object ln_out, py::handle quantizer,
                                       DType out_dtype, const int sm_margin,

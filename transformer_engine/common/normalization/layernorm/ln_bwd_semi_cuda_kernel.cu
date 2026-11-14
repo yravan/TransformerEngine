@@ -14,12 +14,12 @@ using namespace transformer_engine::normalization;
 
 template <typename weight_t, typename input_t, typename output_t, typename compute_t,
           typename index_t, int HIDDEN_SIZE, int CTAS_PER_ROW, int WARPS_M, int WARPS_N,
-          int BYTES_PER_LDG_MAIN, int BYTES_PER_LDG_FINAL>
+          int BYTES_PER_LDG_MAIN, int BYTES_PER_LDG_FINAL, bool FUSED_ADD = false>
 void launch_ln_bwd_tuned_(LaunchParams<BackwardKernelParams> &launch_params,
                           const bool configure_params) {  // NOLINT(*)
   using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
                                       CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG_MAIN>;
-  auto kernel = &ln_bwd_tuned_kernel<Kernel_traits>;
+  auto kernel = &ln_bwd_tuned_kernel<Kernel_traits, FUSED_ADD>;
 
   if (configure_params) {
     int ctas_per_sm;
@@ -73,7 +73,7 @@ void launch_ln_bwd_tuned_(LaunchParams<BackwardKernelParams> &launch_params,
 
 template <typename weight_t, typename input_t, typename output_t, typename compute_t,
           typename index_t, int HIDDEN_SIZE, int WARPS_M, int WARPS_N, int BYTES_PER_LDG_MAIN,
-          int BYTES_PER_LDG_FINAL>
+          int BYTES_PER_LDG_FINAL, bool FUSED_ADD = false>
 void launch_ln_bwd_general_(LaunchParams<BackwardKernelParams> &launch_params,
                             const bool configure_params) {  // NOLINT(*)
   auto ceil_div = [](int x, int y) -> int { return (x + y - 1) / y; };
@@ -81,7 +81,7 @@ void launch_ln_bwd_general_(LaunchParams<BackwardKernelParams> &launch_params,
   // Instantiate kernel
   using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
                                       1, WARPS_M, WARPS_N, BYTES_PER_LDG_MAIN>;
-  auto kernel = &ln_bwd_general_kernel<Kernel_traits>;
+  auto kernel = &ln_bwd_general_kernel<Kernel_traits, FUSED_ADD>;
 
   // Configure kernel params
   const int rows = launch_params.params.rows;
@@ -134,25 +134,35 @@ void launch_ln_bwd_general_(LaunchParams<BackwardKernelParams> &launch_params,
 }
 
 #define REGISTER_NORM_LAUNCHER_LN_BWD_tuned(HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, CTAS_PER_ROW,                                            \
-                                            WARPS_M, WARPS_N, BL_MAIN, BL_FINAL, STATIC_FALLBACK)                                             \
+                                            WARPS_M, WARPS_N, BL_MAIN, BL_FINAL, STATIC_FALLBACK,     \
+                                            STATIC_FALLBACK_ADD)                                             \
   [[maybe_unused]] static const int                                                                                                           \
       _ln_bwd_tuned_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE##_##CTAS_PER_ROW##_##WARPS_M##_##WARPS_N##_##BL_MAIN##_##BL_FINAL = \
           ([] {                                                                                                                               \
             ::transformer_engine::normalization::rtc_norm::register_ln_bwd_tuned(                                                             \
                 TypeToDType<WTYPE>::value, TypeToDType<ITYPE>::value, TypeToDType<OTYPE>::value,                                              \
                 TypeToDType<CTYPE>::value, HIDDEN_SIZE, CTAS_PER_ROW, WARPS_M, WARPS_N, BL_MAIN,                                              \
-                BL_FINAL, STATIC_FALLBACK);                                                                                                   \
+                BL_FINAL, false, STATIC_FALLBACK);                                                                                            \
+            ::transformer_engine::normalization::rtc_norm::register_ln_bwd_tuned(                                                             \
+                TypeToDType<WTYPE>::value, TypeToDType<ITYPE>::value, TypeToDType<OTYPE>::value,                                              \
+                TypeToDType<CTYPE>::value, HIDDEN_SIZE, CTAS_PER_ROW, WARPS_M, WARPS_N, BL_MAIN,                                              \
+                BL_FINAL, true, STATIC_FALLBACK_ADD);                                                                                                   \
             return 0;                                                                                                                         \
           })()
 #define REGISTER_NORM_LAUNCHER_LN_BWD_general(HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, WARPS_M,                                \
-                                              WARPS_N, BL_MAIN, BL_FINAL, STATIC_FALLBACK)                                     \
+                                              WARPS_N, BL_MAIN, BL_FINAL, STATIC_FALLBACK,                     \
+                                              STATIC_FALLBACK_ADD)                                     \
   [[maybe_unused]] static const int                                                                                            \
       _ln_bwd_general_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE##_##WARPS_M##_##WARPS_N##_##BL_MAIN##_##BL_FINAL = \
           ([] {                                                                                                                \
             ::transformer_engine::normalization::rtc_norm::register_ln_bwd_general(                                            \
                 TypeToDType<WTYPE>::value, TypeToDType<ITYPE>::value, TypeToDType<OTYPE>::value,                               \
                 TypeToDType<CTYPE>::value, HIDDEN_SIZE, WARPS_M, WARPS_N, BL_MAIN, BL_FINAL,                                   \
-                STATIC_FALLBACK);                                                                                              \
+                false, STATIC_FALLBACK);                                                                                       \
+            ::transformer_engine::normalization::rtc_norm::register_ln_bwd_general(                                            \
+                TypeToDType<WTYPE>::value, TypeToDType<ITYPE>::value, TypeToDType<OTYPE>::value,                               \
+                TypeToDType<CTYPE>::value, HIDDEN_SIZE, WARPS_M, WARPS_N, BL_MAIN, BL_FINAL,                                   \
+                true, STATIC_FALLBACK_ADD);                                                                                              \
             return 0;                                                                                                          \
           })()
 
@@ -166,15 +176,22 @@ void launch_ln_bwd_general_(LaunchParams<BackwardKernelParams> &launch_params,
     launch_ln_bwd_##LAUNCH_TYPE##_<WTYPE, ITYPE, OTYPE, CTYPE, uint32_t, HIDDEN_SIZE,                           \
                                    __VA_ARGS__>(launch_params, configure_params);                               \
   }                                                                                                             \
+  void                                                                                                          \
+      norm_##NORM_TYPE##_##NORM_STAGE##Add_##LAUNCH_TYPE##_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE( \
+          LaunchParams<NORM_STAGE##KernelParams> &launch_params, const bool configure_params) {                 \
+    launch_ln_bwd_##LAUNCH_TYPE##_<WTYPE, ITYPE, OTYPE, CTYPE, uint32_t, HIDDEN_SIZE,                           \
+                                   __VA_ARGS__, true>(launch_params, configure_params);                         \
+  }                                                                                                             \
   REGISTER_NORM_LAUNCHER_LN_BWD_##LAUNCH_TYPE(                                                                  \
       HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, __VA_ARGS__,                                                     \
-      norm_##NORM_TYPE##_##NORM_STAGE##_##LAUNCH_TYPE##_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE); \
+      norm_##NORM_TYPE##_##NORM_STAGE##_##LAUNCH_TYPE##_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE,  \
+      norm_##NORM_TYPE##_##NORM_STAGE##Add_##LAUNCH_TYPE##_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE); \
   }  // namespace
 #else
 #define REGISTER_NORM_LAUNCHER(NORM_TYPE, NORM_STAGE, LAUNCH_TYPE, HIDDEN_SIZE, WTYPE, ITYPE, \
                                OTYPE, CTYPE, ...)                                             \
   REGISTER_NORM_LAUNCHER_LN_BWD_##LAUNCH_TYPE(HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE,        \
-                                              __VA_ARGS__, nullptr)
+                                              __VA_ARGS__, nullptr, nullptr)
 #endif  // NVTE_BUILD_LEGACY_STATIC_NORM
 
 // Create tuned launch function and register. Macro signature:

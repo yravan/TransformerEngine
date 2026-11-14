@@ -419,6 +419,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("weight"), py::arg("bias"), py::arg("eps"), py::arg("ln_out"), py::arg("quantizer"),
         py::arg("otype"), py::arg("sm_margin"), py::arg("zero_centered_gamma"));
   m.def("layernorm_bwd", &transformer_engine::pytorch::layernorm_bwd, "Backward of LayerNorm");
+  m.def("layernorm_bwd_add", &transformer_engine::pytorch::layernorm_bwd_add,
+        "Fused backward of LayerNorm + add");
   m.def("rmsnorm_fwd", &transformer_engine::pytorch::rmsnorm_fwd, "RMSNorm", py::arg("input"),
         py::arg("weight"), py::arg("eps"), py::arg("ln_out"), py::arg("quantizer"),
         py::arg("otype"), py::arg("sm_margin"), py::arg("zero_centered_gamma"));

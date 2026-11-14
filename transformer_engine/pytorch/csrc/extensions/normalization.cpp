@@ -39,10 +39,13 @@ std::optional<std::pair<size_t, bool>> normalization_scale_layout(const std::str
   return normalization_scale_layout_impl(normalization, *convert_quantizer(quantizer), use_cudnn);
 }
 
-std::vector<py::object> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
-                                      const at::Tensor &mu, const at::Tensor &rsigma,
-                                      const at::Tensor &gamma, const int sm_margin,
-                                      const bool zero_centered_gamma) {
+namespace {
+
+std::vector<py::object> layernorm_bwd_impl(const at::Tensor &dz, const at::Tensor &x,
+                                           const std::optional<at::Tensor> &add,
+                                           const at::Tensor &mu, const at::Tensor &rsigma,
+                                           const at::Tensor &gamma, const int sm_margin,
+                                           const bool zero_centered_gamma) {
   const auto &dz_ = dz.contiguous();
   const auto &x_ = x.contiguous();
   const auto &mu_ = mu.contiguous();
@@ -62,14 +65,31 @@ std::vector<py::object> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
   auto dx_cu = makeTransformerEngineTensor(dx);
   auto dgamma_cu = makeTransformerEngineTensor(dgamma);
   auto dbeta_cu = makeTransformerEngineTensor(dbeta);
+  at::Tensor add_;
+  TensorWrapper add_cu;
+  if (add.has_value()) {
+    add_ = add->contiguous();
+    add_cu = makeTransformerEngineTensor(add_);
+  }
+
+  auto launch = [&]() {
+    if (add.has_value()) {
+      nvte_layernorm_bwd_add(dz_cu.data(), x_cu.data(), add_cu.data(), mu_cu.data(),
+                             rsigma_cu.data(), gamma_cu.data(), dx_cu.data(), dgamma_cu.data(),
+                             dbeta_cu.data(), workspace.data(),
+                             at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin,
+                             zero_centered_gamma, at::cuda::getCurrentCUDAStream());
+    } else {
+      nvte_layernorm_bwd(dz_cu.data(), x_cu.data(), mu_cu.data(), rsigma_cu.data(),
+                         gamma_cu.data(), dx_cu.data(), dgamma_cu.data(), dbeta_cu.data(),
+                         workspace.data(),
+                         at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin,
+                         zero_centered_gamma, at::cuda::getCurrentCUDAStream());
+    }
+  };
 
   // This call populates tensors with the required config.
-  NVTE_SCOPED_GIL_RELEASE({
-    nvte_layernorm_bwd(dz_cu.data(), x_cu.data(), mu_cu.data(), rsigma_cu.data(), gamma_cu.data(),
-                       dx_cu.data(), dgamma_cu.data(), dbeta_cu.data(), workspace.data(),
-                       at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin,
-                       zero_centered_gamma, at::cuda::getCurrentCUDAStream());
-  });
+  NVTE_SCOPED_GIL_RELEASE({ launch(); });
 
   // Alloc space for Tensors.
   auto workspace_data = allocateSpace(workspace.shape(), workspace.dtype());
@@ -77,14 +97,26 @@ std::vector<py::object> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
       makeTransformerEngineTensor(workspace_data.data_ptr(), workspace.shape(), workspace.dtype());
 
   // Actual call to bwd kernel.
-  NVTE_SCOPED_GIL_RELEASE({
-    nvte_layernorm_bwd(dz_cu.data(), x_cu.data(), mu_cu.data(), rsigma_cu.data(), gamma_cu.data(),
-                       dx_cu.data(), dgamma_cu.data(), dbeta_cu.data(), workspace.data(),
-                       at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin,
-                       zero_centered_gamma, at::cuda::getCurrentCUDAStream());
-  });
+  NVTE_SCOPED_GIL_RELEASE({ launch(); });
 
   return {py::cast(dx), py::cast(dgamma), py::cast(dbeta)};
+}
+
+}  // namespace
+
+std::vector<py::object> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
+                                      const at::Tensor &mu, const at::Tensor &rsigma,
+                                      const at::Tensor &gamma, const int sm_margin,
+                                      const bool zero_centered_gamma) {
+  return layernorm_bwd_impl(dz, x, std::nullopt, mu, rsigma, gamma, sm_margin,
+                            zero_centered_gamma);
+}
+
+std::vector<py::object> layernorm_bwd_add(const at::Tensor &dz, const at::Tensor &x,
+                                          const at::Tensor &add, const at::Tensor &mu,
+                                          const at::Tensor &rsigma, const at::Tensor &gamma,
+                                          const int sm_margin, const bool zero_centered_gamma) {
+  return layernorm_bwd_impl(dz, x, add, mu, rsigma, gamma, sm_margin, zero_centered_gamma);
 }
 
 std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, MaybeTensor bias,
