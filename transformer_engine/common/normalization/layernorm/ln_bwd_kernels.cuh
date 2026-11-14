@@ -18,7 +18,7 @@
 namespace transformer_engine {
 namespace normalization {
 
-template <typename Ktraits>
+template <typename Ktraits, bool FusedAdd>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
     BackwardKernelParams params) {
   enum { ROWS_PER_CTA = Ktraits::ROWS_PER_CTA };
@@ -122,11 +122,22 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
       }
     }
 
+    // With FusedAdd, dx is preloaded with `add` (same dtype as dx) and each
+    // element is replaced by the sum, rounded once.
+    Ivec dx[LDGS];
+    if constexpr (FusedAdd) {
+      idx = row * Ktraits::VEC_COLS + c;
+#pragma unroll
+      for (int it = 0; it < LDGS; it++) {
+        dx[it].load_from(params.add, idx);
+        idx += Ktraits::VEC_COLS_PER_LDG;
+      }
+    }
+
     reduce_t result = reducer.allreduce({mdy_local, mdyy_local}, sum);
     mdy_local = Get<0>::of<reduce_t, compute_t>(result) * rn;
     mdyy_local = Get<1>::of<reduce_t, compute_t>(result) * rn;
 
-    Ivec dx[LDGS];
     idx = row * Ktraits::VEC_COLS + c;
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
@@ -135,6 +146,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
         compute_t dy_tmp = dy[it * NUM_ELTS + jt];
         compute_t y_tmp = y[it * NUM_ELTS + jt];
         compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
+        if constexpr (FusedAdd) {
+          dx_tmp += compute_t(dx[it].data.elt[jt]);
+        }
         dx[it].data.elt[jt] = dx_tmp;
       }
       dx[it].store_to(params.dx, idx);
@@ -325,7 +339,7 @@ __global__ __launch_bounds__(Kernel_traits::THREADS_PER_CTA) void ln_bwd_finaliz
   }
 }
 
-template <typename Ktraits>
+template <typename Ktraits, bool FusedAdd>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_general_kernel(
     BackwardKernelParams params) {
   enum { LDGS = Ktraits::LDGS };
@@ -436,11 +450,18 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_general_kerne
     for (int it = 0, col = gidn * NUM_ELTS; it < LDGS && row < params.rows && col < params.cols;
          it++, col += gdimn * NUM_ELTS) {
       Ivec dx;
+      if constexpr (FusedAdd) {
+        dx.load_from_elts(params.add, row * params.cols + col, params.cols - col);
+      }
 #pragma unroll
       for (int jt = 0; jt < NUM_ELTS; jt++) {
         compute_t dy_ij = dy[it].data.elt[jt];
         compute_t y_ij = y[it].data.elt[jt];
-        dx.data.elt[jt] = rs * (dy_ij - (mdyy * y_ij + mdy));
+        compute_t dx_ij = rs * (dy_ij - (mdyy * y_ij + mdy));
+        if constexpr (FusedAdd) {
+          dx_ij += compute_t(dx.data.elt[jt]);
+        }
+        dx.data.elt[jt] = dx_ij;
       }
       dx.store_to_elts(params.dx, row * params.cols + col, params.cols - col);
     }

@@ -394,19 +394,23 @@ void register_rmsnorm_fwd_general(DType wt, DType it, DType ot, DType ct, int hi
 // ============================================================================
 
 void register_ln_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidden, int cr, int wm,
-                           int wn, int bl_main, int bl_final,
+                           int wn, int bl_main, int bl_final, bool with_add,
                            StaticFallback<BackwardKernelParams> static_fallback) {
-  const auto key = get_key(NVTE_Norm_Backend::Te, NVTE_Norm_Type::LayerNorm,
-                           NVTE_Norm_Stage::Backward, wt, it, ot, ct, 0, hidden, false, true);
-  const std::string label =
-      concat_strings("ln_bwd_tuned,w=", static_cast<int>(wt), ",i=", static_cast<int>(it),
-                     ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden,
-                     ",cr=", cr, ",wm=", wm, ",wn=", wn, ",bl=", bl_main, ",blf=", bl_final);
+  const auto stage = with_add ? NVTE_Norm_Stage::BackwardAdd : NVTE_Norm_Stage::Backward;
+  const auto key = get_key(NVTE_Norm_Backend::Te, NVTE_Norm_Type::LayerNorm, stage, wt, it, ot, ct,
+                           0, hidden, false, true);
+  const std::string add_tag = with_add ? "_add" : "";
+  const std::string label = concat_strings(
+      "ln_bwd_tuned", add_tag, ",w=", static_cast<int>(wt), ",i=", static_cast<int>(it),
+      ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden, ",cr=", cr,
+      ",wm=", wm, ",wn=", wn, ",bl=", bl_main, ",blf=", bl_final);
   const std::string main_label = concat_strings(label, ",main");
   const std::string finalize_label = concat_strings(label, ",finalize");
   const std::string main_traits = kernel_traits_expr(wt, it, ot, ct, hidden, cr, wm, wn, bl_main);
-  const std::string main_kexpr = concat_strings(
-      "&::transformer_engine::normalization::ln_bwd_tuned_kernel<", main_traits, ">");
+  const char* add_flag = with_add ? "true" : "false";
+  const std::string main_kexpr =
+      concat_strings("&::transformer_engine::normalization::ln_bwd_tuned_kernel<", main_traits,
+                     ", ", add_flag, ">");
   // Kernel_traits_finalize<HIDDEN_SIZE, weight_t, input_t, output_t, compute_t, index_t,
   //                         THREADS_PER_CTA (32 * 32), BYTES_PER_LDG_FINAL>
   const std::string finalize_traits =
@@ -484,19 +488,23 @@ void register_ln_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidden, i
 }
 
 void register_ln_bwd_general(DType wt, DType it, DType ot, DType ct, int hidden, int wm, int wn,
-                             int bl_main, int bl_final,
+                             int bl_main, int bl_final, bool with_add,
                              StaticFallback<BackwardKernelParams> static_fallback) {
-  const auto key = get_key(NVTE_Norm_Backend::Te, NVTE_Norm_Type::LayerNorm,
-                           NVTE_Norm_Stage::Backward, wt, it, ot, ct, 0, hidden, false, false);
-  const std::string label =
-      concat_strings("ln_bwd_general,w=", static_cast<int>(wt), ",i=", static_cast<int>(it),
-                     ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden,
-                     ",wm=", wm, ",wn=", wn, ",bl=", bl_main, ",blf=", bl_final);
+  const auto stage = with_add ? NVTE_Norm_Stage::BackwardAdd : NVTE_Norm_Stage::Backward;
+  const auto key = get_key(NVTE_Norm_Backend::Te, NVTE_Norm_Type::LayerNorm, stage, wt, it, ot, ct,
+                           0, hidden, false, false);
+  const std::string add_tag = with_add ? "_add" : "";
+  const std::string label = concat_strings(
+      "ln_bwd_general", add_tag, ",w=", static_cast<int>(wt), ",i=", static_cast<int>(it),
+      ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden, ",wm=", wm,
+      ",wn=", wn, ",bl=", bl_main, ",blf=", bl_final);
   const std::string main_label = concat_strings(label, ",main");
   const std::string finalize_label = concat_strings(label, ",finalize");
   const std::string traits = kernel_traits_expr(wt, it, ot, ct, hidden, 1, wm, wn, bl_main);
+  const char* add_flag = with_add ? "true" : "false";
   const std::string main_kexpr =
-      concat_strings("&::transformer_engine::normalization::ln_bwd_general_kernel<", traits, ">");
+      concat_strings("&::transformer_engine::normalization::ln_bwd_general_kernel<", traits, ", ",
+                     add_flag, ">");
   // ln_bwd_finalize_general_kernel<weight_t, compute_t, WARPS_M_FINAL=4, WARPS_N_FINAL=1,
   //                                BYTES_PER_LDG_FINAL, THREADS_PER_WARP=32>
   const std::string finalize_kexpr =
