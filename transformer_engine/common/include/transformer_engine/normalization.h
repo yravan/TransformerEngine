@@ -101,6 +101,33 @@ void nvte_layernorm_bwd(const NVTETensor dz, const NVTETensor x, const NVTETenso
                         const int multiprocessorCount, const bool zero_centered_gamma,
                         cudaStream_t stream);
 
+/*! \brief Compute backward of LayerNorm and add a tensor to the input gradient.
+ *
+ * Same as nvte_layernorm_bwd, with dx = LayerNorm_bwd(dz) + add computed in the
+ * compute type and rounded once.
+ *
+ *  \param[in]     dz                  Incoming gradient tensor of shape [..., H].
+ *  \param[in]     x                   Forward input tensor of shape [..., H].
+ *  \param[in]     add                 Tensor added to the input gradient, shape and dtype of x.
+ *  \param[in]     mu                  Mean of the input calculated over the last dimension.
+ *                                     Shape: [N].
+ *  \param[in]     rsigma              Inverse of the variance of the input calculated over
+ *                                     the last dimension. Shape: [N].
+ *  \param[in]     gamma               Gamma tensor of shape [H].
+ *  \param[out]    dx                  Output gradient of shape [..., H].
+ *  \param[out]    dgamma              Gradient for gamma tensor of shape [H].
+ *  \param[out]    dbeta               Gradient for beta tensor of shape [H].
+ *  \param[out]    workspace           Workspace tensor.
+ *  \param[in]     multiprocessorCount Number of SMs in the device.
+ *  \param[in]     zero_centered_gamma Multiply normalized values by @f$ \gamma+1 @f$ instead of @f$ \gamma @f$
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_layernorm_bwd_add(const NVTETensor dz, const NVTETensor x, const NVTETensor add,
+                            const NVTETensor mu, const NVTETensor rsigma, const NVTETensor gamma,
+                            NVTETensor dx, NVTETensor dgamma, NVTETensor dbeta,
+                            NVTETensor workspace, const int multiprocessorCount,
+                            const bool zero_centered_gamma, cudaStream_t stream);
+
 /*! \brief Compute RMSNorm.
  *
  * The formula used:
