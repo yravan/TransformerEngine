@@ -22,7 +22,7 @@ from torch.distributed.tensor import DTensor
 import transformer_engine_torch as tex
 
 from transformer_engine.pytorch.device import te_device_type
-from ._common import _ParameterInitMeta, noop_cat, sum_bias_grad
+from ._common import _ParameterInitMeta, noop_cat, qkv_rope_backward, sum_bias_grad
 from .._extra_state import (
     extra_state_pickle_advisory,
     is_stateless_recipe,
@@ -1831,6 +1831,29 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         gather_grad_output = row_parallel_mode and ctx.sequence_parallel
         use_fp8_bwd = ctx.fp8 and ctx.backward_override is None
 
+        # Inverse RoPE on a packed q/k/v gradient: fused into the MXFP8 dbias quantize below
+        # when that one runs, otherwise applied here.
+        rope_kwargs = {}
+        if getattr(ctx, "rope_cos", None) is not None:
+            if (
+                use_fp8_bwd
+                and not ctx.debug
+                and not gather_grad_output
+                and ctx.use_bias
+                and isinstance(quantizer, MXFP8Quantizer)
+                and not isinstance(grad_output, QuantizedTensorStorage)
+            ):
+                rope_kwargs = {
+                    "rope_cos": ctx.rope_cos,
+                    "rope_sin": ctx.rope_sin,
+                    "head_dim": ctx.rope_head_dim,
+                    "rope_cols": 2 * grad_output.shape[-1] // 3,
+                }
+            else:
+                grad_output = qkv_rope_backward(
+                    grad_output, ctx.rope_cos, ctx.rope_sin, ctx.rope_head_dim
+                )
+
         # Non-FP8 case: bgrad is fused with wgrad for this case.
         if not use_fp8_bwd and not ctx.debug:
             if gather_grad_output:
@@ -1913,7 +1936,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     # Custom recipes may provide quantizers unknown to the C++ extension.
                     grad_bias = sum_bias_grad(grad_output)
                 else:
-                    grad_bias, grad_output = tex.bgrad_quantize(grad_output, quantizer)
+                    grad_bias, grad_output = tex.bgrad_quantize(
+                        grad_output, quantizer, **rope_kwargs
+                    )
         if not isinstance(grad_output, QuantizedTensorStorage):
             grad_output = quantizer(grad_output)
         return grad_output, grad_bias

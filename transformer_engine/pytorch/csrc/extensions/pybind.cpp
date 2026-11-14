@@ -247,7 +247,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("otype"), py::arg("tensor_offsets") = py::none(),
         py::arg("return_dequantized") = false);
   m.def("bgrad_quantize", transformer_engine::pytorch::bgrad_quantize,
-        "Compute bias gradient and quantize", py::arg("input"), py::arg("quantizer"));
+        "Compute bias gradient and quantize", py::arg("input"), py::arg("quantizer"),
+        py::arg("rope_cos") = py::none(), py::arg("rope_sin") = py::none(),
+        py::arg("head_dim") = 0, py::arg("rope_cols") = 0);
   m.def("generic_gemm", transformer_engine::pytorch::gemm, "Compute GEMM (matrix-matrix multiply)",
         py::arg("A"), py::arg("transA"), py::arg("B"), py::arg("transB"), py::arg("D"),
         py::arg("quantizer"), py::arg("output_dtype"), py::arg("bias"), py::arg("bias_type"),
