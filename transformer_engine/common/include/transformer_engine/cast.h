@@ -146,6 +146,31 @@ void nvte_quantize_v2(const NVTETensor input, NVTETensor output,
 void nvte_quantize_dbias(const NVTETensor input, NVTETensor output, NVTETensor dbias,
                          NVTETensor workspace, cudaStream_t stream);
 
+/*! \brief Casts the gradient of a packed RoPE projection to MXFP8 after rotating it back, and
+ *         reduces the rotated gradient along columns.
+ *
+ * The first `rope_cols` columns of `input` are attention heads of `head_dim` elements whose pairs
+ * (2i, 2i+1), 2i < rot_dim, were rotated by RoPE in the forward pass. The inverse rotation is
+ * applied in FP32 and rounded to BF16 before the cast, so the results equal a separate rotation
+ * kernel followed by nvte_quantize_dbias. Row r uses row (r % seq_len) of the tables.
+ * Needs a BF16 input, an MXFP8 output with rowwise and columnwise data, head_dim dividing 64,
+ * rot_dim a multiple of 4, rope_cols a multiple of 256 and 16-byte aligned tables.
+ *
+ *  \param[in]     input            Input tensor to be rotated and cast.
+ *  \param[in,out] output           Output MXFP8 tensor.
+ *  \param[out]    dbias            Reduction of the rotated input along columns.
+ *  \param[out]    workspace        Workspace tensor.
+ *  \param[in]     rope_cos         FP32 cos table of shape [seq_len, rot_dim].
+ *  \param[in]     rope_sin         FP32 sin table of shape [seq_len, rot_dim].
+ *  \param[in]     head_dim         Elements per attention head.
+ *  \param[in]     rope_cols        Number of leading columns that hold rotated heads.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_quantize_dbias_rope(const NVTETensor input, NVTETensor output, NVTETensor dbias,
+                              NVTETensor workspace, const NVTETensor rope_cos,
+                              const NVTETensor rope_sin, size_t head_dim, size_t rope_cols,
+                              cudaStream_t stream);
+
 /*! \brief Casts input grouped tensor to MXFP8. Additionally, reduces the input along columns.
  *         If the scaling mode of the output tensor is set to NVTE_MXFP8_1D_SCALING,
  *         the block quantization (MXFP8) of the specified shape of the block will be used.
