@@ -248,6 +248,7 @@ class LayerNormMLPFwdArgs:
     bwd_ln_sm_margin: int
     return_layernorm_output: bool
     return_layernorm_output_gathered: bool
+    return_input_grad_sink: bool
 
     # --- Activation ---
     activation: str
@@ -328,6 +329,7 @@ class LayerNormMLPBwdArgs:
     # --- Incoming gradients (populated at backward entry) ---
     grad_output: Optional[torch.Tensor] = None
     grad_ln_out: Optional[torch.Tensor] = None
+    grad_input_sink: Optional[torch.Tensor] = None
 
     # --- Saved / restored tensors (populated at backward entry) ---
     inputmat: Optional[torch.Tensor] = None
@@ -435,7 +437,7 @@ class LayerNormMLPBwdArgs:
 
     def setup_grad_outputs(self, grads: Sequence[Any]) -> None:
         """Unpack gradients in forward-output order, ignoring weight workspaces."""
-        self.grad_output, self.grad_ln_out, _, _ = grads
+        self.grad_output, self.grad_ln_out, _, _, self.grad_input_sink = grads
 
     def setup_saved_tensors(self, ctx: torch.autograd.function.FunctionCtx) -> None:
         """Pull saved tensors from ``ctx`` into the fields backward consumes."""
@@ -1094,15 +1096,19 @@ def _layernorm_mlp_forward_impl(
         ctx_attrs["is_recomputation"] = is_recomputation
 
         if is_recomputation:  # return the recomputed tensors
-            return None, None, None, None, tensors_to_save_from_forward, ctx_attrs
+            return None, None, None, None, None, tensors_to_save_from_forward, ctx_attrs
 
     # we only get to this point if we are not recomputing for bwd, since that would have returned in the block above
     ln_out_for_return = ln_out_return if return_layernorm_output else None
+    input_grad_sink = None
+    if args.return_input_grad_sink and is_grad_enabled and args.input_requires_grad:
+        input_grad_sink = torch.empty_like(inputmat)
     return (
         fc2_out,
         ln_out_for_return,
         new_fc1_weight_workspace,
         new_fc2_weight_workspace,
+        input_grad_sink,
         tensors_to_save_from_forward,
         ctx_attrs,
     )
@@ -1326,6 +1332,7 @@ def _layernorm_mlp_recompute(
         _,
         new_fc1_weight_workspace,
         new_fc2_weight_workspace,
+        _,
         tensors_to_save_from_forward,
         ctx_attrs,
     ) = _layernorm_mlp_forward_impl(fwd_args)
@@ -2039,10 +2046,13 @@ def _layernorm_mlp_backward_impl(
         # Norm gradient
         dgamma = None
         dbeta = None
+        # The input-grad sink's gradient is added to dgrad inside the norm kernel.
+        add = () if args.grad_input_sink is None else (args.grad_input_sink,)
         if args.normalization == "LayerNorm":
-            dgrad, dgamma, dbeta = tex.layernorm_bwd(
+            dgrad, dgamma, dbeta = (tex.layernorm_bwd_add if add else tex.layernorm_bwd)(
                 dgrad,
                 inputmat,
+                *add,
                 mu,
                 rsigma,
                 ln_weight,
@@ -2050,9 +2060,10 @@ def _layernorm_mlp_backward_impl(
                 args.zero_centered_gamma,
             )
         elif args.normalization == "RMSNorm":
-            dgrad, dgamma = tex.rmsnorm_bwd(
+            dgrad, dgamma = (tex.rmsnorm_bwd_add if add else tex.rmsnorm_bwd)(
                 dgrad,
                 inputmat,
+                *add,
                 rsigma,
                 ln_weight,
                 args.bwd_ln_sm_margin,
@@ -2429,11 +2440,17 @@ def _layernorm_mlp_forward_fake(
             "is_recomputation": False,
         }
 
+    input_grad_sink = None
+    if args.return_input_grad_sink and args.is_grad_enabled and args.input_requires_grad:
+        input_grad_sink = TensorSpec(
+            shape=tuple(args.inp.shape), dtype=args.activation_dtype, device=args.inp.device
+        )
     return (
         fc2_out,
         ln_out_for_return,
         new_fc1_weight_workspace,
         new_fc2_weight_workspace,
+        input_grad_sink,
         tensors_to_save_from_forward,
         ctx_attrs,
     )
@@ -2580,6 +2597,7 @@ class _LayerNormMLP(torch.autograd.Function):
             ln_out_return,
             new_fc1_weight_workspace,
             new_fc2_weight_workspace,
+            input_grad_sink,
             tensors_to_save_from_forward,
             ctx_attrs,
         ) = _layernorm_mlp_forward_impl(fwd_args)
@@ -2599,7 +2617,13 @@ class _LayerNormMLP(torch.autograd.Function):
             if not bwd_args.checkpoint and fwd_args.fp8 and fwd_args.any_requires_grad():
                 bwd_args.reduce_and_update_bwd_fp8_tensors = check_fp8_reduce_and_update()
 
-        return out, ln_out_return, new_fc1_weight_workspace, new_fc2_weight_workspace
+        return (
+            out,
+            ln_out_return,
+            new_fc1_weight_workspace,
+            new_fc2_weight_workspace,
+            input_grad_sink,
+        )
 
     @staticmethod
     def backward(
@@ -2608,11 +2632,18 @@ class _LayerNormMLP(torch.autograd.Function):
         grad_ln_out: Optional[torch.Tensor],
         _grad_fc1_weight_workspace,
         _grad_fc2_weight_workspace,
+        grad_input_sink: Optional[torch.Tensor],
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """Backward pass: compute gradients and reduce FP8 scaling factors."""
         bwd_args: LayerNormMLPBwdArgs = ctx.backward_objects
         bwd_args.setup_grad_outputs(
-            (grad_output, grad_ln_out, _grad_fc1_weight_workspace, _grad_fc2_weight_workspace)
+            (
+                grad_output,
+                grad_ln_out,
+                _grad_fc1_weight_workspace,
+                _grad_fc2_weight_workspace,
+                grad_input_sink,
+            )
         )
         with get_nvtx_range_context("_LayerNormMLP_backward"):
             _layernorm_mlp_recompute(bwd_args, ctx)
@@ -3091,6 +3122,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self,
         inp: torch.Tensor,
         is_first_microbatch: Optional[bool] = None,
+        return_input_grad_sink: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply layer normalization to the input followed by a feedforward network (MLP Block).
@@ -3119,6 +3151,12 @@ class LayerNormMLP(TransformerEngineBaseModule):
                              With ``mode="reduce-overhead"``, call
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
+        return_input_grad_sink : bool, default = False
+                             Also return an uninitialized tensor shaped like ``inp`` whose
+                             gradient is added to the input gradient inside the norm backward
+                             kernel (one rounding), or ``None`` when no input gradient is
+                             computed. For a residual connection around this module, pass the
+                             residual gradient through it instead of letting autograd add it.
         """
         is_grad_enabled = torch.is_grad_enabled()
 
@@ -3317,6 +3355,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 bwd_ln_sm_margin=self.bwd_ln_sm_margin,
                 return_layernorm_output=self.return_layernorm_output,
                 return_layernorm_output_gathered=self.return_layernorm_output_gathered,
+                return_input_grad_sink=return_input_grad_sink,
                 # activation
                 activation=self.activation,
                 activation_params=self.activation_params,
@@ -3367,9 +3406,9 @@ class LayerNormMLP(TransformerEngineBaseModule):
             )
 
             if use_compiled_op:
-                out, ln_out, new_fc1_ws, new_fc2_ws = _layernorm_mlp_op(fwd_args)
+                out, ln_out, new_fc1_ws, new_fc2_ws, input_grad_sink = _layernorm_mlp_op(fwd_args)
             else:
-                out, ln_out, new_fc1_ws, new_fc2_ws = _layernorm_mlp_eager(
+                out, ln_out, new_fc1_ws, new_fc2_ws, input_grad_sink = _layernorm_mlp_eager(
                     (
                         inp,
                         self.layer_norm_weight,
@@ -3398,6 +3437,16 @@ class LayerNormMLP(TransformerEngineBaseModule):
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(fc2_bias, self.activation_dtype)
 
+        if return_input_grad_sink:
+            return (
+                *(
+                    (out, cast_if_needed(fc2_bias, self.activation_dtype))
+                    if self.return_bias
+                    else (out,)
+                ),
+                *((ln_out,) if self.return_layernorm_output else ()),
+                input_grad_sink,
+            )
         if self.return_bias:
             if self.return_layernorm_output:
                 return out, cast_if_needed(fc2_bias, self.activation_dtype), ln_out
