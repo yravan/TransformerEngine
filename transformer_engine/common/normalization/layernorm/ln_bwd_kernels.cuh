@@ -87,17 +87,23 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
     const compute_t rs_r = static_cast<const compute_t *>(params.rs)[row];
     Ivec x[LDGS];
     Ovec dz[LDGS];
+    // With FusedAdd, dx is preloaded with `add` (same dtype as dx) and each
+    // element is replaced by the sum, rounded once.
+    Ivec dx[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
       dz[it].load_from(params.dz, idx);
       x[it].load_from(params.x, idx);
+      if constexpr (FusedAdd) {
+        dx[it].load_from(params.add, idx);
+      }
       idx += Ktraits::VEC_COLS_PER_LDG;
     }
 
-    compute_t dy[LDGS * NUM_ELTS];
-    compute_t y[LDGS * NUM_ELTS];
-
+    // y and dy are recomputed from x and dz in the dx loop instead of being
+    // kept in fp32 registers (same operations, same results; fewer registers).
+    const compute_t dy_tmp_shift = (params.zero_centered_gamma) ? 1.0f : 0.f;
     compute_t mdy_local = 0.f;
     compute_t mdyy_local = 0.f;
 #pragma unroll
@@ -106,7 +112,6 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
       for (int jt = 0; jt < NUM_ELTS; jt++) {
         const compute_t x_tmp = x[it].data.elt[jt];
         const compute_t y_tmp = rs_r * (x_tmp - mu_r);
-        const compute_t dy_tmp_shift = (params.zero_centered_gamma) ? 1.0f : 0.f;
         compute_t dy_tmp = compute_t(gamma[it].data.elt[jt]) + dy_tmp_shift;
         dy_tmp *= compute_t(dz[it].data.elt[jt]);
         compute_t dz_tmp = dz[it].data.elt[jt];
@@ -114,23 +119,8 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
         mdy_local += dy_tmp;
         mdyy_local += dy_tmp * y_tmp;
 
-        dy[it * NUM_ELTS + jt] = dy_tmp;
-        y[it * NUM_ELTS + jt] = y_tmp;
-
         dzy_sum[it].data.elt[jt] += dz_tmp * y_tmp;
         dz_sum[it].data.elt[jt] += dz_tmp;
-      }
-    }
-
-    // With FusedAdd, dx is preloaded with `add` (same dtype as dx) and each
-    // element is replaced by the sum, rounded once.
-    Ivec dx[LDGS];
-    if constexpr (FusedAdd) {
-      idx = row * Ktraits::VEC_COLS + c;
-#pragma unroll
-      for (int it = 0; it < LDGS; it++) {
-        dx[it].load_from(params.add, idx);
-        idx += Ktraits::VEC_COLS_PER_LDG;
       }
     }
 
@@ -143,8 +133,10 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
     for (int it = 0; it < LDGS; it++) {
 #pragma unroll
       for (int jt = 0; jt < NUM_ELTS; jt++) {
-        compute_t dy_tmp = dy[it * NUM_ELTS + jt];
-        compute_t y_tmp = y[it * NUM_ELTS + jt];
+        const compute_t x_tmp = x[it].data.elt[jt];
+        const compute_t y_tmp = rs_r * (x_tmp - mu_r);
+        compute_t dy_tmp = compute_t(gamma[it].data.elt[jt]) + dy_tmp_shift;
+        dy_tmp *= compute_t(dz[it].data.elt[jt]);
         compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
         if constexpr (FusedAdd) {
           dx_tmp += compute_t(dx[it].data.elt[jt]);
