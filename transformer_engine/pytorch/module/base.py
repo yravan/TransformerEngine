@@ -22,7 +22,13 @@ from torch.distributed.tensor import DTensor
 import transformer_engine_torch as tex
 
 from transformer_engine.pytorch.device import te_device_type
-from ._common import _ParameterInitMeta, noop_cat, qkv_rope_backward, sum_bias_grad
+from ._common import (
+    _ParameterInitMeta,
+    noop_cat,
+    qkv_rope_backward,
+    qkv_rope_fused_layout,
+    sum_bias_grad,
+)
 from .._extra_state import (
     extra_state_pickle_advisory,
     is_stateless_recipe,
@@ -1832,7 +1838,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         use_fp8_bwd = ctx.fp8 and ctx.backward_override is None
 
         # Inverse RoPE on a packed q/k/v gradient: fused into the MXFP8 dbias quantize below
-        # when that one runs, otherwise applied here.
+        # when that one runs and supports the layout, otherwise applied here.
         rope_kwargs = {}
         if getattr(ctx, "rope_cos", None) is not None:
             if (
@@ -1842,6 +1848,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 and ctx.use_bias
                 and isinstance(quantizer, MXFP8Quantizer)
                 and not isinstance(grad_output, QuantizedTensorStorage)
+                and qkv_rope_fused_layout(ctx.rope_cos, ctx.rope_head_dim, grad_output.shape[-1])
             ):
                 rope_kwargs = {
                     "rope_cos": ctx.rope_cos,

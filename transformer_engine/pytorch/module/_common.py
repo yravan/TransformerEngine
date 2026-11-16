@@ -61,6 +61,22 @@ def qkv_rope_backward(
     return out.view(grad.shape)
 
 
+def qkv_rope_fused_layout(cos: torch.Tensor, head_dim: int, qkv_dim: int) -> bool:
+    """Whether the MXFP8 dbias quantize can apply the inverse RoPE of this layout itself.
+
+    Mirrors the layout check of the fused kernel (``quantize_mxfp8.cuh``); any other layout
+    takes ``qkv_rope_backward``. ``qkv_dim`` is the packed q/k/v width, ``3 * heads * head_dim``.
+    """
+    rot_dim = cos.shape[1]
+    return (
+        head_dim % 8 == 0
+        and 64 % head_dim == 0
+        and rot_dim % 4 == 0
+        and rot_dim <= head_dim
+        and (2 * qkv_dim // 3) % 256 == 0
+    )
+
+
 def set_quantizer_amax_reduction_group(quantizer, amax_reduction_group) -> None:
     """Set the amax reduction group on a quantizer; no-op if it doesn't support it.
 
