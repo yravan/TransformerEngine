@@ -1392,12 +1392,12 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         )
 
         # Quantizers
-        fc1_input_quantizer = fc1_op.get_quantizer("forward", 0)
+        fc1_input_quantizer = fc1_ctx.input_quantizer
         fc1_weight_quantizer = fc1_op.get_quantizer("forward", 1)
-        fc1_grad_output_quantizer = fc1_op.get_quantizer("backward", 0)
-        fc2_input_quantizer = fc2_op.get_quantizer("forward", 0)
+        fc1_grad_output_quantizer = fc1_ctx.grad_output_quantizer
+        fc2_input_quantizer = fc2_ctx.input_quantizer
         fc2_weight_quantizer = fc2_op.get_quantizer("forward", 1)
-        fc2_grad_output_quantizer = fc2_op.get_quantizer("backward", 0)
+        fc2_grad_output_quantizer = fc2_ctx.grad_output_quantizer
         # Per-expert weight quantizer lists are built lazily, only on the discrete-weight and
         # distributed-weight paths that consume them.
         fc1_weight_quantizers = None
