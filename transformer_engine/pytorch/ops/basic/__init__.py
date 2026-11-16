@@ -6,6 +6,7 @@
 
 from .activation import (
     GELU,
+    GELUErf,
     GEGLU,
     GLU,
     QGELU,

@@ -13,6 +13,7 @@ from typing import Any, Optional
 import torch
 
 import transformer_engine_torch as tex
+from ... import fused_kernels
 from ...constants import DType
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
 from ...tensor.float8_tensor import Float8CurrentScalingQuantizer, Quantizer
@@ -22,6 +23,7 @@ from .._common import maybe_autocast_dtype, maybe_dequantize
 
 __all__ = [
     "GELU",
+    "GELUErf",
     "GEGLU",
     "GLU",
     "QGELU",
@@ -162,6 +164,24 @@ class GELU(_ActivationOperation):
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
         return tex.dgelu(*args, **kwargs)
+
+
+class GELUErf(_ActivationOperation):
+    r"""Gaussian Error Linear Unit, exact form
+
+    .. math::
+
+       \text{GELU}(x) = \frac{x}{2} \left( 1 + \text{erf}\left( \frac{x}{\sqrt{2}} \right) \right)
+
+    Matches ``torch.nn.functional.gelu(x, approximate="none")``.
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return fused_kernels.gelu_erf(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return fused_kernels.dgelu_erf(*args, **kwargs)
 
 
 class GLU(_ActivationOperation):
