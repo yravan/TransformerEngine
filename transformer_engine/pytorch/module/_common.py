@@ -40,43 +40,6 @@ def sum_bias_grad(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.sum(dim=tuple(range(tensor.ndim - 1)))
 
 
-def qkv_rope_backward(
-    grad: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, head_dim: int
-) -> torch.Tensor:
-    """Rotate the q and k parts of a packed q/k/v gradient back by the inverse RoPE.
-
-    ``grad`` is ``(..., seq_len, 3 * heads * head_dim)``; ``cos`` / ``sin`` are FP32
-    ``[seq_len, rot_dim]`` tables.
-    """
-    seq_len, rot_dim = cos.shape
-    g = grad.reshape(-1, seq_len, 3, grad.shape[-1] // (3 * head_dim), head_dim)
-    x = g[:, :, :2, :, :rot_dim].float().unflatten(-1, (rot_dim // 2, 2))
-    c = cos.view(seq_len, 1, 1, rot_dim // 2, 2)
-    s = sin.view(seq_len, 1, 1, rot_dim // 2, 2)
-    xe, xo = x[..., 0], x[..., 1]
-    y = torch.stack((xe * c[..., 0] + xo * s[..., 1], xo * c[..., 1] - xe * s[..., 0]), dim=-1)
-    out = g.clone()
-    out[:, :, :2, :, :rot_dim] = y.flatten(-2).to(grad.dtype)
-    return out.view(grad.shape)
-
-
-def qkv_rope_fused_layout(cos: torch.Tensor, head_dim: int, qkv_dim: int) -> bool:
-    """Whether ``fused_kernels.bgrad_quantize_rope`` takes this layout.
-
-    These are the layouts an MXFP8 dbias quantize can apply the inverse RoPE of itself; any
-    other layout takes ``qkv_rope_backward``. ``qkv_dim`` is the packed q/k/v width,
-    ``3 * heads * head_dim``.
-    """
-    rot_dim = cos.shape[1]
-    return (
-        head_dim % 8 == 0
-        and 64 % head_dim == 0
-        and rot_dim % 4 == 0
-        and rot_dim <= head_dim
-        and (2 * qkv_dim // 3) % 256 == 0
-    )
-
-
 def set_quantizer_amax_reduction_group(quantizer, amax_reduction_group) -> None:
     """Set the amax reduction group on a quantizer; no-op if it doesn't support it.
 

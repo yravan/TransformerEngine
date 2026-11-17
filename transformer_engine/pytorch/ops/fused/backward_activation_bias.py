@@ -10,13 +10,11 @@ from typing import Optional
 import torch
 
 import transformer_engine_torch as tex
-from transformer_engine.pytorch import fused_kernels
 from transformer_engine.pytorch.quantization import Recipe
 from transformer_engine.pytorch.ops.basic import Bias
 from transformer_engine.pytorch.ops.basic.activation import (
     _ActivationOperation,
     GELU,
-    GELUErf,
     ReLU,
 )
 from transformer_engine.pytorch.ops.op import (
@@ -27,11 +25,7 @@ from transformer_engine.pytorch.ops.op import (
 from ...utils import clear_tensor_data
 from .._common import maybe_dequantize
 
-_fused_activations = {
-    GELU: tex.dbias_dgelu,
-    GELUErf: lambda *args: fused_kernels.dbias_dgelu_erf(*args),
-    ReLU: tex.dbias_drelu,
-}
+_fused_activations = {GELU: tex.dbias_dgelu, ReLU: tex.dbias_drelu}
 _fusible_activations = tuple(_fused_activations.keys())
 
 

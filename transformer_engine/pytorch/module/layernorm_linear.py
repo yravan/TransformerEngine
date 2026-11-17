@@ -18,7 +18,6 @@ from transformer_engine.common.recipe import Recipe
 from transformer_engine.pytorch.torch_version import torch_version
 from transformer_engine.pytorch.tensor.utils import clear_columnwise_cache, is_custom
 from transformer_engine.pytorch.device import te_device_type
-from .. import fused_kernels
 from .base import (
     fill_userbuffers_buffer_for_all_gather,
     get_cublasmp_all_gather_output,
@@ -128,11 +127,6 @@ class LayerNormLinearFwdArgs:
     # --- Non-differentiable cached tensors ---
     weight_workspace: Optional[TensorOrQuantized]
 
-    # --- RoPE applied by the caller to the q and k parts of a packed q/k/v output ---
-    rope_cos: Optional[torch.Tensor]
-    rope_sin: Optional[torch.Tensor]
-    rope_head_dim: int
-
     # --- requires_grad flags (cached so backward does not re-query) ---
     input_requires_grad: bool
     ln_weight_requires_grad: bool
@@ -156,7 +150,6 @@ class LayerNormLinearFwdArgs:
     bwd_ln_sm_margin: int
     return_layernorm_output: bool
     return_layernorm_output_gathered: bool
-    return_input_grad_sink: bool
 
     # --- Numerical / dtype config ---
     activation_dtype: torch.dtype
@@ -222,7 +215,6 @@ class LayerNormLinearBwdArgs:
     # --- Incoming gradients (populated at backward entry) ---
     grad_output: Optional[torch.Tensor] = None
     grad_ln_out: Optional[torch.Tensor] = None
-    grad_input_sink: Optional[torch.Tensor] = None
 
     # --- Saved / restored tensors (populated at backward entry) ---
     inputmat: Optional[torch.Tensor] = None
@@ -233,8 +225,6 @@ class LayerNormLinearBwdArgs:
     ln_out: Optional[TensorOrQuantized] = None
     mu: Optional[torch.Tensor] = None
     rsigma: Optional[torch.Tensor] = None
-    rope_cos: Optional[torch.Tensor] = None
-    rope_sin: Optional[torch.Tensor] = None
 
     # --- Quantizers ---
     input_quantizer: Optional[Quantizer] = None
@@ -254,7 +244,6 @@ class LayerNormLinearBwdArgs:
     normalization: str = "LayerNorm"
     zero_centered_gamma: bool = False
     bwd_ln_sm_margin: int = 0
-    rope_head_dim: int = 0
     return_layernorm_output: bool = False
     return_layernorm_output_gathered: bool = False
 
@@ -305,7 +294,7 @@ class LayerNormLinearBwdArgs:
 
     def setup_grad_outputs(self, grads: Sequence[Any]) -> None:
         """Unpack gradients in forward-output order, ignoring weight workspaces."""
-        self.grad_output, self.grad_ln_out, _, self.grad_input_sink = grads
+        self.grad_output, self.grad_ln_out, _ = grads
 
     def setup_saved_tensors(self, ctx: torch.autograd.function.FunctionCtx) -> None:
         """Pull saved tensors from ``ctx`` into the fields backward consumes."""
@@ -318,8 +307,6 @@ class LayerNormLinearBwdArgs:
             self.ln_out,
             self.mu,
             self.rsigma,
-            self.rope_cos,
-            self.rope_sin,
         ) = restore_from_func_ctx(
             ctx
         )  # pylint: disable=unbalanced-tuple-unpacking
@@ -754,17 +741,7 @@ def _layernorm_linear_forward_impl(
         }
 
     ln_out_for_return = ln_out_return if return_layernorm_output else None
-    input_grad_sink = None
-    if args.return_input_grad_sink and is_grad_enabled and args.input_requires_grad:
-        input_grad_sink = torch.empty_like(inputmat)
-    return (
-        out,
-        ln_out_for_return,
-        new_weight_workspace,
-        input_grad_sink,
-        tensors_to_save_from_forward,
-        ctx_attrs,
-    )
+    return out, ln_out_for_return, new_weight_workspace, tensors_to_save_from_forward, ctx_attrs
 
 
 def _layernorm_linear_setup_ctx(
@@ -813,7 +790,6 @@ def _layernorm_linear_setup_ctx(
     bwd_args.normalization = fwd_args.normalization
     bwd_args.zero_centered_gamma = fwd_args.zero_centered_gamma
     bwd_args.bwd_ln_sm_margin = fwd_args.bwd_ln_sm_margin
-    bwd_args.rope_head_dim = fwd_args.rope_head_dim
     bwd_args.return_layernorm_output = fwd_args.return_layernorm_output
     bwd_args.return_layernorm_output_gathered = fwd_args.return_layernorm_output_gathered
 
@@ -927,8 +903,6 @@ def _layernorm_linear_setup_ctx(
         saved_ln_out,
         mu,
         rsigma,
-        fwd_args.rope_cos,
-        fwd_args.rope_sin,
     )
 
 
@@ -1451,13 +1425,10 @@ def _layernorm_linear_backward_impl(
         dgamma = None
         dbeta = None
         nvtx_range_push(f"{nvtx_label}.norm")
-        # The input-grad sink's gradient is added to dgrad inside the norm kernel.
-        add = () if args.grad_input_sink is None else (args.grad_input_sink,)
         if args.normalization == "LayerNorm":
-            dgrad, dgamma, dbeta = (fused_kernels.layernorm_bwd_add if add else tex.layernorm_bwd)(
+            dgrad, dgamma, dbeta = tex.layernorm_bwd(
                 dgrad,
                 inputmat,
-                *add,
                 mu,
                 rsigma,
                 ln_weight,
@@ -1465,10 +1436,9 @@ def _layernorm_linear_backward_impl(
                 args.zero_centered_gamma,
             )
         elif args.normalization == "RMSNorm":
-            dgrad, dgamma = (tex.rmsnorm_bwd_add if add else tex.rmsnorm_bwd)(
+            dgrad, dgamma = tex.rmsnorm_bwd(
                 dgrad,
                 inputmat,
-                *add,
                 rsigma,
                 ln_weight,
                 args.bwd_ln_sm_margin,
@@ -1782,19 +1752,7 @@ def _layernorm_linear_forward_fake(
             "ln_out_needs_gather": ln_out_needs_gather,
         }
 
-    input_grad_sink = None
-    if args.return_input_grad_sink and args.is_grad_enabled and args.input_requires_grad:
-        input_grad_sink = TensorSpec(
-            shape=tuple(args.inp.shape), dtype=args.activation_dtype, device=device
-        )
-    return (
-        out,
-        ln_out_for_return,
-        new_weight_workspace,
-        input_grad_sink,
-        tensors_to_save_from_forward,
-        ctx_attrs,
-    )
+    return out, ln_out_for_return, new_weight_workspace, tensors_to_save_from_forward, ctx_attrs
 
 
 def _layernorm_linear_backward_fake(
@@ -1900,7 +1858,6 @@ class _LayerNormLinear(torch.autograd.Function):
             out,
             ln_out_return,
             new_weight_workspace,
-            input_grad_sink,
             tensors_to_save_from_forward,
             ctx_attrs,
         ) = _layernorm_linear_forward_impl(fwd_args)
@@ -1922,7 +1879,7 @@ class _LayerNormLinear(torch.autograd.Function):
             if fwd_args.backward_override is not None:
                 bwd_args.reduce_and_update_bwd_fp8_tensors = False
 
-        return out, ln_out_return, new_weight_workspace, input_grad_sink
+        return out, ln_out_return, new_weight_workspace
 
     @staticmethod
     def backward(
@@ -1930,13 +1887,10 @@ class _LayerNormLinear(torch.autograd.Function):
         grad_output: torch.Tensor,
         grad_ln_out: Optional[torch.Tensor],
         _grad_weight_workspace,
-        grad_input_sink: Optional[torch.Tensor],
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """Backward pass: compute gradients and reduce FP8 scaling factors."""
         bwd_args: LayerNormLinearBwdArgs = ctx.backward_objects
-        bwd_args.setup_grad_outputs(
-            (grad_output, grad_ln_out, _grad_weight_workspace, grad_input_sink)
-        )
+        bwd_args.setup_grad_outputs((grad_output, grad_ln_out, _grad_weight_workspace))
         bwd_args.setup_saved_tensors(ctx)
         nvtx_label = "transformer_engine._LayerNormLinear.backward"
         if bwd_args.ub_name is not None:
@@ -2450,8 +2404,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
         is_first_microbatch: Optional[bool] = None,
         fp8_output: Optional[bool] = False,
         fp8_grad: Optional[bool] = False,
-        qkv_rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
-        return_input_grad_sink: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply layer normalization to the input followed by a linear transformation.
@@ -2480,21 +2432,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
                              With ``mode="reduce-overhead"``, call
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
-        qkv_rope : (torch.Tensor, torch.Tensor, int), default = None
-                  ``(cos, sin, head_dim)`` when the output is a packed ``(..., 3, heads,
-                  head_dim)`` q/k/v projection to whose q and k parts the caller applies
-                  RoPE without differentiating through it: pairs ``(2i, 2i+1)`` with
-                  ``2i < rot_dim`` rotate by row ``n`` of the FP32 ``[seq_len, rot_dim]``
-                  tables, ``n`` being the token index along the second-to-last input
-                  dimension. The backward pass then rotates the q and k output gradient
-                  back, inside the MXFP8 grad-output quantize when that one runs.
-        return_input_grad_sink : bool, default = False
-                             Also return an uninitialized tensor shaped like ``inp`` whose
-                             gradient is added to the input gradient by the norm backward
-                             (``fused_kernels.layernorm_bwd_add`` for LayerNorm), or ``None``
-                             when no input gradient is computed. For a residual connection
-                             around this module, pass the residual gradient through it instead
-                             of letting autograd add it.
         """
         is_grad_enabled = torch.is_grad_enabled()
 
@@ -2624,9 +2561,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 weight=weight_tensor,
                 bias=linear_bias_tensor,
                 weight_workspace=weight_workspace,
-                rope_cos=qkv_rope[0] if qkv_rope is not None else None,
-                rope_sin=qkv_rope[1] if qkv_rope is not None else None,
-                rope_head_dim=qkv_rope[2] if qkv_rope is not None else 0,
                 # requires_grad flags
                 input_requires_grad=inp.requires_grad,
                 ln_weight_requires_grad=self.layer_norm_weight.requires_grad,
@@ -2656,7 +2590,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 bwd_ln_sm_margin=self.bwd_ln_sm_margin,
                 return_layernorm_output=self.return_layernorm_output,
                 return_layernorm_output_gathered=self.return_layernorm_output_gathered,
-                return_input_grad_sink=return_input_grad_sink,
                 # numerical / dtype config
                 activation_dtype=self.activation_dtype,
                 fp8=self.fp8,
@@ -2698,9 +2631,9 @@ class LayerNormLinear(TransformerEngineBaseModule):
 
             if use_compiled_op:
                 check_gemm_dims(inp, weight_tensor, self.fp8)
-                out, ln_out, new_weight_workspace, input_grad_sink = _layernorm_linear_op(fwd_args)
+                out, ln_out, new_weight_workspace = _layernorm_linear_op(fwd_args)
             else:
-                out, ln_out, new_weight_workspace, input_grad_sink = _layernorm_linear_eager(
+                out, ln_out, new_weight_workspace = _layernorm_linear_eager(
                     inp,
                     self.layer_norm_weight,
                     self.layer_norm_bias,
@@ -2721,16 +2654,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(bias_tensor, self.activation_dtype)
 
-        if return_input_grad_sink:
-            return (
-                *(
-                    (out, cast_if_needed(bias_tensor, self.activation_dtype))
-                    if self.return_bias
-                    else (out,)
-                ),
-                *((ln_out,) if self.return_layernorm_output else ()),
-                input_grad_sink,
-            )
         if self.return_bias:
             if self.return_layernorm_output:
                 return out, cast_if_needed(bias_tensor, self.activation_dtype), ln_out
@@ -2749,20 +2672,20 @@ class LayerNormLinear(TransformerEngineBaseModule):
         grad_weight_quantizer = None
         grad_output_quantizer = None
         output_quantizer = None
-        input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_INPUT)
+        input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
         input_quantizer.internal = True
         if not (self.parallel_mode == "column" and self.sequence_parallel):
             input_quantizer.optimize_for_gemm = True
         (weight_quantizer,) = self._get_weight_quantizers()
         if fp8_output:
-            output_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_OUTPUT)
+            output_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_OUTPUT]
         if is_grad_enabled:
-            grad_output_quantizer = self._call_quantizer("scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT1)
+            grad_output_quantizer = self.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_OUTPUT1]
             grad_output_quantizer.internal = True
             if not (self.parallel_mode == "row" and self.sequence_parallel):
                 grad_output_quantizer.optimize_for_gemm = True
             if fp8_grad:
-                grad_input_quantizer = self._call_quantizer("scaling_bwd", FP8BwdTensorIdx.GRAD_INPUT1)
+                grad_input_quantizer = self.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_INPUT1]
 
         return (
             input_quantizer,
@@ -2952,6 +2875,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
             return [None]
-        weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_WEIGHT)
+        weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
         weight_quantizer.internal = True
         return [weight_quantizer]

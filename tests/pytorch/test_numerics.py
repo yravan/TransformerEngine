@@ -50,7 +50,6 @@ from transformer_engine.pytorch.distributed import (
 from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import DType
-from transformer_engine.pytorch import fused_kernels
 import transformer_engine_torch as tex
 from utils import ModelConfig, recipe_id, reset_rng_states, skip_unsupported_backward_override
 
@@ -94,8 +93,6 @@ _FP8_RECOMPUTE_KEY = "global_fp8_buffer_pos_fwd_recompute"
 all_activations = [
     "gelu",
     "geglu",
-    "gelu_erf",
-    "geglu_erf",
     "glu",
     "qgelu",
     "qgeglu",
@@ -497,8 +494,6 @@ class TorchSquaredRELU(nn.Module):
 _supported_act = {
     "gelu": nn.GELU(approximate="tanh"),
     "geglu": nn.GELU(approximate="tanh"),
-    "gelu_erf": nn.GELU(),
-    "geglu_erf": nn.GELU(),
     "glu": nn.Sigmoid(),
     "qgelu": TorchQuickGELU(),
     "qgeglu": TorchQuickGELU(),
@@ -2124,51 +2119,6 @@ def test_layernorm_mlp_accuracy(dtype, bs, model, activation, normalization, ret
     if model == "small":
         for te_output, torch_output in zip(te_outputs[1:], torch_outputs[1:]):
             assert_allclose(te_output, torch_output, atol[dtype], rtol[dtype])
-
-
-def test_gelu_erf_matches_torch_bitwise():
-    """fused_kernels.gelu_erf / dgelu_erf equal torch's exact GELU bit for bit on every bf16
-    input; quantized, they equal the FP8 cast of torch's BF16 result."""
-    x = torch.arange(1 << 16, dtype=torch.int32, device="cuda").to(torch.int16).view(torch.bfloat16)
-    xf = x.float()
-    ones = torch.ones_like(xf)
-
-    def same(a, b):
-        nan = a.isnan() & b.isnan()
-        return bool(((a.view(torch.int32) == b.view(torch.int32)) | nan).all())
-
-    assert same(fused_kernels.gelu_erf(xf, None), torch.nn.functional.gelu(xf))
-    assert same(
-        fused_kernels.dgelu_erf(ones, xf, None),
-        torch.ops.aten.gelu_backward(ones, xf, approximate="none"),
-    )
-    if not fp8_available:
-        return
-
-    def quantizer():
-        q = Float8Quantizer(
-            scale=torch.full((1,), 3.5, device="cuda"),
-            amax=torch.zeros(1, device="cuda"),
-            fp8_dtype=tex.DType.kFloat8E4M3,
-        )
-        q.set_usage(rowwise=True, columnwise=False)
-        return q
-
-    def to_fp8(v):
-        return (v * 3.5).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
-
-    g = torch.randn(xf.shape, device="cuda").to(torch.bfloat16)
-    ref_fwd = torch.nn.functional.gelu(x).float()
-    ref_bwd = torch.ops.aten.gelu_backward(g, x, approximate="none").float()
-    x2d, g2d = x.view(512, 128), g.view(512, 128)
-    for out, ref in (
-        (fused_kernels.gelu_erf(x2d, quantizer()), ref_fwd),
-        (fused_kernels.dgelu_erf(g2d, x2d, quantizer()), ref_bwd),
-        (fused_kernels.dbias_dgelu_erf(g2d, x2d, quantizer())[1], ref_bwd),
-    ):
-        valid = ~ref.isnan()
-        data = out._data.view(torch.uint8).flatten()
-        assert torch.equal(data[valid], to_fp8(ref)[valid])
 
 
 @pytest.mark.parametrize("dtype", param_types)

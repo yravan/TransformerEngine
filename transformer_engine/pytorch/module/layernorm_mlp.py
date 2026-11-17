@@ -19,7 +19,6 @@ from transformer_engine.common.recipe import Recipe
 from transformer_engine.pytorch.torch_version import torch_version
 from transformer_engine.pytorch.tensor.utils import clear_columnwise_cache, is_custom
 from transformer_engine.pytorch.device import te_device_type
-from .. import fused_kernels
 from .base import (
     fill_userbuffers_buffer_for_all_gather,
     get_cublasmp_all_gather_output,
@@ -121,8 +120,6 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),
-            "gelu_erf": (fused_kernels.gelu_erf, fused_kernels.dgelu_erf, None),
-            "geglu_erf": (fused_kernels.geglu_erf, fused_kernels.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -140,12 +137,6 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, tex.dbias_dgelu),
             "geglu": (tex.geglu, tex.dgeglu, None),
-            "gelu_erf": (
-                fused_kernels.gelu_erf,
-                fused_kernels.dgelu_erf,
-                fused_kernels.dbias_dgelu_erf,
-            ),
-            "geglu_erf": (fused_kernels.geglu_erf, fused_kernels.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, tex.dbias_dqgelu),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -169,8 +160,6 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),
-            "gelu_erf": (fused_kernels.gelu_erf, fused_kernels.dgelu_erf, None),
-            "geglu_erf": (fused_kernels.geglu_erf, fused_kernels.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -201,7 +190,7 @@ def _act_func(
 
 # Activations whose output halves the last dim (gated linear units).
 _GATED_ACTIVATIONS = frozenset(
-    {"geglu", "geglu_erf", "glu", "qgeglu", "reglu", "sreglu", "swiglu", "clamped_swiglu"}
+    {"geglu", "glu", "qgeglu", "reglu", "sreglu", "swiglu", "clamped_swiglu"}
 )
 
 
@@ -253,7 +242,6 @@ class LayerNormMLPFwdArgs:
     bwd_ln_sm_margin: int
     return_layernorm_output: bool
     return_layernorm_output_gathered: bool
-    return_input_grad_sink: bool
 
     # --- Activation ---
     activation: str
@@ -334,7 +322,6 @@ class LayerNormMLPBwdArgs:
     # --- Incoming gradients (populated at backward entry) ---
     grad_output: Optional[torch.Tensor] = None
     grad_ln_out: Optional[torch.Tensor] = None
-    grad_input_sink: Optional[torch.Tensor] = None
 
     # --- Saved / restored tensors (populated at backward entry) ---
     inputmat: Optional[torch.Tensor] = None
@@ -442,7 +429,7 @@ class LayerNormMLPBwdArgs:
 
     def setup_grad_outputs(self, grads: Sequence[Any]) -> None:
         """Unpack gradients in forward-output order, ignoring weight workspaces."""
-        self.grad_output, self.grad_ln_out, _, _, self.grad_input_sink = grads
+        self.grad_output, self.grad_ln_out, _, _ = grads
 
     def setup_saved_tensors(self, ctx: torch.autograd.function.FunctionCtx) -> None:
         """Pull saved tensors from ``ctx`` into the fields backward consumes."""
@@ -1101,19 +1088,15 @@ def _layernorm_mlp_forward_impl(
         ctx_attrs["is_recomputation"] = is_recomputation
 
         if is_recomputation:  # return the recomputed tensors
-            return None, None, None, None, None, tensors_to_save_from_forward, ctx_attrs
+            return None, None, None, None, tensors_to_save_from_forward, ctx_attrs
 
     # we only get to this point if we are not recomputing for bwd, since that would have returned in the block above
     ln_out_for_return = ln_out_return if return_layernorm_output else None
-    input_grad_sink = None
-    if args.return_input_grad_sink and is_grad_enabled and args.input_requires_grad:
-        input_grad_sink = torch.empty_like(inputmat)
     return (
         fc2_out,
         ln_out_for_return,
         new_fc1_weight_workspace,
         new_fc2_weight_workspace,
-        input_grad_sink,
         tensors_to_save_from_forward,
         ctx_attrs,
     )
@@ -1337,7 +1320,6 @@ def _layernorm_mlp_recompute(
         _,
         new_fc1_weight_workspace,
         new_fc2_weight_workspace,
-        _,
         tensors_to_save_from_forward,
         ctx_attrs,
     ) = _layernorm_mlp_forward_impl(fwd_args)
@@ -2051,13 +2033,10 @@ def _layernorm_mlp_backward_impl(
         # Norm gradient
         dgamma = None
         dbeta = None
-        # The input-grad sink's gradient is added to dgrad inside the norm kernel.
-        add = () if args.grad_input_sink is None else (args.grad_input_sink,)
         if args.normalization == "LayerNorm":
-            dgrad, dgamma, dbeta = (fused_kernels.layernorm_bwd_add if add else tex.layernorm_bwd)(
+            dgrad, dgamma, dbeta = tex.layernorm_bwd(
                 dgrad,
                 inputmat,
-                *add,
                 mu,
                 rsigma,
                 ln_weight,
@@ -2065,10 +2044,9 @@ def _layernorm_mlp_backward_impl(
                 args.zero_centered_gamma,
             )
         elif args.normalization == "RMSNorm":
-            dgrad, dgamma = (tex.rmsnorm_bwd_add if add else tex.rmsnorm_bwd)(
+            dgrad, dgamma = tex.rmsnorm_bwd(
                 dgrad,
                 inputmat,
-                *add,
                 rsigma,
                 ln_weight,
                 args.bwd_ln_sm_margin,
@@ -2445,17 +2423,11 @@ def _layernorm_mlp_forward_fake(
             "is_recomputation": False,
         }
 
-    input_grad_sink = None
-    if args.return_input_grad_sink and args.is_grad_enabled and args.input_requires_grad:
-        input_grad_sink = TensorSpec(
-            shape=tuple(args.inp.shape), dtype=args.activation_dtype, device=args.inp.device
-        )
     return (
         fc2_out,
         ln_out_for_return,
         new_fc1_weight_workspace,
         new_fc2_weight_workspace,
-        input_grad_sink,
         tensors_to_save_from_forward,
         ctx_attrs,
     )
@@ -2602,7 +2574,6 @@ class _LayerNormMLP(torch.autograd.Function):
             ln_out_return,
             new_fc1_weight_workspace,
             new_fc2_weight_workspace,
-            input_grad_sink,
             tensors_to_save_from_forward,
             ctx_attrs,
         ) = _layernorm_mlp_forward_impl(fwd_args)
@@ -2622,13 +2593,7 @@ class _LayerNormMLP(torch.autograd.Function):
             if not bwd_args.checkpoint and fwd_args.fp8 and fwd_args.any_requires_grad():
                 bwd_args.reduce_and_update_bwd_fp8_tensors = check_fp8_reduce_and_update()
 
-        return (
-            out,
-            ln_out_return,
-            new_fc1_weight_workspace,
-            new_fc2_weight_workspace,
-            input_grad_sink,
-        )
+        return out, ln_out_return, new_fc1_weight_workspace, new_fc2_weight_workspace
 
     @staticmethod
     def backward(
@@ -2637,18 +2602,11 @@ class _LayerNormMLP(torch.autograd.Function):
         grad_ln_out: Optional[torch.Tensor],
         _grad_fc1_weight_workspace,
         _grad_fc2_weight_workspace,
-        grad_input_sink: Optional[torch.Tensor],
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """Backward pass: compute gradients and reduce FP8 scaling factors."""
         bwd_args: LayerNormMLPBwdArgs = ctx.backward_objects
         bwd_args.setup_grad_outputs(
-            (
-                grad_output,
-                grad_ln_out,
-                _grad_fc1_weight_workspace,
-                _grad_fc2_weight_workspace,
-                grad_input_sink,
-            )
+            (grad_output, grad_ln_out, _grad_fc1_weight_workspace, _grad_fc2_weight_workspace)
         )
         with get_nvtx_range_context("_LayerNormMLP_backward"):
             _layernorm_mlp_recompute(bwd_args, ctx)
@@ -2711,7 +2669,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                    type of normalization applied.
     activation : str, default = 'gelu'
           activation function used.
-          Options: ``'gelu'``, ``'geglu'``, ``'gelu_erf'``, ``'geglu_erf'``, ``'glu'``, ``'qgelu'``, ``'qgeglu'``, ``'relu'``, ``'reglu'``, ``'srelu'``, ``'sreglu'``,
+          Options: ``'gelu'``, ``'geglu'``, ``'glu'``, ``'qgelu'``, ``'qgeglu'``, ``'relu'``, ``'reglu'``, ``'srelu'``, ``'sreglu'``,
           ``'silu'``, ``'swiglu'``, and ``'clamped_swiglu'``.
     activation_params : dict, default = None
                         Additional parameters for the activation function.
@@ -2955,7 +2913,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
         # FC1 init
         if self.activation in [
             "geglu",
-            "geglu_erf",
             "glu",
             "qgeglu",
             "reglu",
@@ -3127,7 +3084,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self,
         inp: torch.Tensor,
         is_first_microbatch: Optional[bool] = None,
-        return_input_grad_sink: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply layer normalization to the input followed by a feedforward network (MLP Block).
@@ -3156,13 +3112,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
                              With ``mode="reduce-overhead"``, call
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
-        return_input_grad_sink : bool, default = False
-                             Also return an uninitialized tensor shaped like ``inp`` whose
-                             gradient is added to the input gradient by the norm backward
-                             (``fused_kernels.layernorm_bwd_add`` for LayerNorm), or ``None``
-                             when no input gradient is computed. For a residual connection
-                             around this module, pass the residual gradient through it instead
-                             of letting autograd add it.
         """
         is_grad_enabled = torch.is_grad_enabled()
 
@@ -3361,7 +3310,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 bwd_ln_sm_margin=self.bwd_ln_sm_margin,
                 return_layernorm_output=self.return_layernorm_output,
                 return_layernorm_output_gathered=self.return_layernorm_output_gathered,
-                return_input_grad_sink=return_input_grad_sink,
                 # activation
                 activation=self.activation,
                 activation_params=self.activation_params,
@@ -3412,9 +3360,9 @@ class LayerNormMLP(TransformerEngineBaseModule):
             )
 
             if use_compiled_op:
-                out, ln_out, new_fc1_ws, new_fc2_ws, input_grad_sink = _layernorm_mlp_op(fwd_args)
+                out, ln_out, new_fc1_ws, new_fc2_ws = _layernorm_mlp_op(fwd_args)
             else:
-                out, ln_out, new_fc1_ws, new_fc2_ws, input_grad_sink = _layernorm_mlp_eager(
+                out, ln_out, new_fc1_ws, new_fc2_ws = _layernorm_mlp_eager(
                     (
                         inp,
                         self.layer_norm_weight,
@@ -3443,16 +3391,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(fc2_bias, self.activation_dtype)
 
-        if return_input_grad_sink:
-            return (
-                *(
-                    (out, cast_if_needed(fc2_bias, self.activation_dtype))
-                    if self.return_bias
-                    else (out,)
-                ),
-                *((ln_out,) if self.return_layernorm_output else ()),
-                input_grad_sink,
-            )
         if self.return_bias:
             if self.return_layernorm_output:
                 return out, cast_if_needed(fc2_bias, self.activation_dtype), ln_out
@@ -3517,11 +3455,11 @@ class LayerNormMLP(TransformerEngineBaseModule):
         ) = [None] * 10
         fc1_weight_quantizer, fc2_weight_quantizer = self._get_weight_quantizers()
         if self.fp8 or self.fp8_calibration:
-            fc1_input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_INPUT)
+            fc1_input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
             fc1_input_quantizer.internal = True
             if not self.sequence_parallel:
                 fc1_input_quantizer.optimize_for_gemm = True
-            fc2_input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_INPUT)
+            fc2_input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_INPUT]
             fc2_input_quantizer.set_usage(
                 rowwise=True,
                 columnwise=isinstance(
@@ -3532,17 +3470,17 @@ class LayerNormMLP(TransformerEngineBaseModule):
             fc2_input_quantizer.internal = True
             fc2_input_quantizer.optimize_for_gemm = True
             if fp8_output:
-                fc2_output_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_OUTPUT)
+                fc2_output_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_OUTPUT]
             if is_grad_enabled:
-                fc2_grad_output_quantizer = self._call_quantizer(
-                    "scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT2
-                )
+                fc2_grad_output_quantizer = self.quantizers["scaling_bwd"][
+                    FP8BwdTensorIdx.GRAD_OUTPUT2
+                ]
                 fc2_grad_output_quantizer.internal = True
                 if not self.sequence_parallel:
                     fc2_grad_output_quantizer.optimize_for_gemm = True
-                fc1_grad_output_quantizer = self._call_quantizer(
-                    "scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT1
-                )
+                fc1_grad_output_quantizer = self.quantizers["scaling_bwd"][
+                    FP8BwdTensorIdx.GRAD_OUTPUT1
+                ]
                 fc1_grad_output_quantizer.internal = True
                 fc1_grad_output_quantizer.optimize_for_gemm = True
 
@@ -3633,8 +3571,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
         activation_map = {
             "gelu": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
             "geglu": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
-            "gelu_erf": torch.nn.functional.gelu,
-            "geglu_erf": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
             "glu": lambda x: torch.sigmoid(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
             "qgelu": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
             "qgeglu": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0], approximate="tanh")
@@ -3755,9 +3691,9 @@ class LayerNormMLP(TransformerEngineBaseModule):
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
             return [None, None]
-        fc1_weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_WEIGHT)
+        fc1_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
         fc1_weight_quantizer.internal = True
-        fc2_weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_WEIGHT)
+        fc2_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_WEIGHT]
         fc2_weight_quantizer.internal = True
         return [fc1_weight_quantizer, fc2_weight_quantizer]
 
