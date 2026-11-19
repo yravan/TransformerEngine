@@ -114,7 +114,12 @@ def fake_activation(
 def _normalization_scale_layout(
     normalization: str, quantizer: Quantizer, use_cudnn: bool
 ) -> Optional[tuple[int, bool]]:
-    """Return (alignment, swizzled scales), or None to keep the quantizer's layout."""
+    """Return (alignment, swizzled scales), or None to keep the quantizer's layout.
+
+    ``quantizer`` must be the call's own copy: ``assume_constant_result`` guards an
+    object argument read from a module attribute by identity, which recompiles once
+    per module instance sharing the code.
+    """
     return tex.normalization_scale_layout(normalization, quantizer, use_cudnn)
 
 

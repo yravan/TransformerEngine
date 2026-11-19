@@ -35,6 +35,35 @@ void nvte_dgeglu(const NVTETensor grad, const NVTETensor input, NVTETensor outpu
   dgated_act_fn<fp32, Empty, gelu<fp32, fp32>, dgelu<fp32, fp32>>(grad, input, output, e, stream);
 }
 
+void nvte_gelu_erf(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_gelu_erf);
+  using namespace transformer_engine;
+  act_fn<fp32, Empty, gelu_erf<fp32, fp32>>(input, output, stream);
+}
+
+void nvte_dgelu_erf(const NVTETensor grad, const NVTETensor input, NVTETensor output,
+                    cudaStream_t stream) {
+  NVTE_API_CALL(nvte_dgelu_erf);
+  using namespace transformer_engine;
+  dact_fn<fp32, Empty, dgelu_erf<fp32, fp32>>(grad, input, output, stream);
+}
+
+void nvte_geglu_erf(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_geglu_erf);
+  using namespace transformer_engine;
+  Empty e = {};
+  gated_act_fn<fp32, Empty, gelu_erf<fp32, fp32>>(input, output, e, stream);
+}
+
+void nvte_dgeglu_erf(const NVTETensor grad, const NVTETensor input, NVTETensor output,
+                     cudaStream_t stream) {
+  NVTE_API_CALL(nvte_dgeglu_erf);
+  using namespace transformer_engine;
+  Empty e = {};
+  dgated_act_fn<fp32, Empty, gelu_erf<fp32, fp32>, dgelu_erf<fp32, fp32>>(grad, input, output, e,
+                                                                         stream);
+}
+
 void nvte_qgelu(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
   NVTE_API_CALL(nvte_qgelu);
   using namespace transformer_engine;

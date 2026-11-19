@@ -36,39 +36,68 @@ inline bool full_tile_1D_tensor(const Tensor *const t, const size_t elems_per_bl
 namespace kernel {
 
 constexpr size_t THREADS_PER_BLOCK = 256;
+constexpr size_t DBIAS_ROW_THREADS = 8;
+constexpr size_t DBIAS_MAX_ROW_BLOCKS = 128;
+constexpr size_t DBIAS_COL_THREADS = 8;
+constexpr size_t DBIAS_GROUP_THREADS = 64;
+
 template <int nvec, typename OType>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+__global__ void __launch_bounds__(DBIAS_COL_THREADS *DBIAS_GROUP_THREADS)
     reduce_dbias_kernel(OType *const dbias_output, const float *const dbias_partial,
-                        const size_t rows, const size_t cols) {
+                        const size_t rows, const size_t cols, const size_t rows_per_block,
+                        const size_t groups) {
   using ComputeVec = Vec<float, nvec>;
-  using OutputVec = Vec<OType, nvec>;
+  __shared__ float smem[DBIAS_MAX_ROW_BLOCKS][DBIAS_COL_THREADS * nvec];
 
-  const size_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t col = (blockIdx.x * DBIAS_COL_THREADS + threadIdx.x) * nvec;
+  const bool active = col < cols;
 
-  if (thread_id * nvec >= cols) {
-    return;
-  }
-
-  const float *const thread_in_base = dbias_partial + thread_id * nvec;
-  OType *const thread_out_base = dbias_output + thread_id * nvec;
-
-  ComputeVec ldg_vec;
-  ComputeVec acc_vec;
-  acc_vec.clear();
-  for (int i = 0; i < rows; ++i) {
-    ldg_vec.load_from(thread_in_base + i * cols);
+  if (active) {
+    for (size_t g = threadIdx.y; g < groups; g += DBIAS_GROUP_THREADS) {
+      const size_t row_begin = g * rows_per_block;
+      const size_t row_end = min(rows, row_begin + rows_per_block);
+      ComputeVec acc[DBIAS_ROW_THREADS];
 #pragma unroll
-    for (int e = 0; e < nvec; ++e) {
-      acc_vec.data.elt[e] += ldg_vec.data.elt[e];
+      for (int t = 0; t < DBIAS_ROW_THREADS; ++t) {
+        acc[t].clear();
+      }
+      for (size_t base = row_begin; base < row_end; base += DBIAS_ROW_THREADS) {
+        ComputeVec ldg_vec[DBIAS_ROW_THREADS];
+#pragma unroll
+        for (int t = 0; t < DBIAS_ROW_THREADS; ++t) {
+          if (base + t < row_end) {
+            ldg_vec[t].load_from(dbias_partial + (base + t) * cols + col);
+          }
+        }
+#pragma unroll
+        for (int t = 0; t < DBIAS_ROW_THREADS; ++t) {
+          if (base + t < row_end) {
+#pragma unroll
+            for (int e = 0; e < nvec; ++e) {
+              acc[t].data.elt[e] += ldg_vec[t].data.elt[e];
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int e = 0; e < nvec; ++e) {
+        float sum = 0.f;
+#pragma unroll
+        for (int t = 0; t < DBIAS_ROW_THREADS; ++t) {
+          sum += acc[t].data.elt[e];
+        }
+        smem[g][threadIdx.x * nvec + e] = sum;
+      }
     }
   }
-
-  OutputVec stg_vec;
-#pragma unroll
-  for (int e = 0; e < nvec; ++e) {
-    stg_vec.data.elt[e] = static_cast<OType>(acc_vec.data.elt[e]);
+  __syncthreads();
+  if (active && threadIdx.y < nvec) {
+    float acc = 0.f;
+    for (size_t g = 0; g < groups; ++g) {
+      acc += smem[g][threadIdx.x * nvec + threadIdx.y];
+    }
+    dbias_output[col + threadIdx.y] = static_cast<OType>(acc);
   }
-  stg_vec.store_to(thread_out_base);
 }
 
 template <int nvec, typename OType>
@@ -131,11 +160,15 @@ void reduce_dbias(const float *workspace_ptr, Tensor *dbias, const size_t rows, 
   constexpr size_t reduce_dbias_nvec = reduce_dbias_store_bytes / sizeof(IType);
 
   NVTE_CHECK(cols % reduce_dbias_nvec == 0, "Unsupported shape.");
-  const size_t reduce_dbias_num_blocks = DIVUP(cols, THREADS_PER_BLOCK * reduce_dbias_nvec);
 
-  reduce_dbias_kernel<reduce_dbias_nvec, IType>
-      <<<reduce_dbias_num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-          reinterpret_cast<IType *>(dbias->data.dptr), workspace_ptr, rows, cols);
+  const size_t row_blocks = min(rows, DBIAS_MAX_ROW_BLOCKS);
+  const size_t rows_per_block = DIVUP(rows, row_blocks);
+  const size_t groups = DIVUP(rows, rows_per_block);
+  const dim3 block(DBIAS_COL_THREADS, DBIAS_GROUP_THREADS);
+  const dim3 grid(DIVUP(cols, DBIAS_COL_THREADS * reduce_dbias_nvec));
+  reduce_dbias_kernel<reduce_dbias_nvec, IType><<<grid, block, 0, stream>>>(
+      reinterpret_cast<IType *>(dbias->data.dptr), workspace_ptr, rows, cols, rows_per_block,
+      groups);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 

@@ -120,6 +120,8 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),
+            "gelu_erf": (tex.gelu_erf, tex.dgelu_erf, None),
+            "geglu_erf": (tex.geglu_erf, tex.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -137,6 +139,8 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, tex.dbias_dgelu),
             "geglu": (tex.geglu, tex.dgeglu, None),
+            "gelu_erf": (tex.gelu_erf, tex.dgelu_erf, tex.dbias_dgelu_erf),
+            "geglu_erf": (tex.geglu_erf, tex.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, tex.dbias_dqgelu),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -160,6 +164,8 @@ def _get_act_func_supported_list(
         return {
             "gelu": (tex.gelu, tex.dgelu, None),
             "geglu": (tex.geglu, tex.dgeglu, None),
+            "gelu_erf": (tex.gelu_erf, tex.dgelu_erf, None),
+            "geglu_erf": (tex.geglu_erf, tex.dgeglu_erf, None),
             "glu": (tex.glu, tex.dglu, None),
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
@@ -190,7 +196,7 @@ def _act_func(
 
 # Activations whose output halves the last dim (gated linear units).
 _GATED_ACTIVATIONS = frozenset(
-    {"geglu", "glu", "qgeglu", "reglu", "sreglu", "swiglu", "clamped_swiglu"}
+    {"geglu", "geglu_erf", "glu", "qgeglu", "reglu", "sreglu", "swiglu", "clamped_swiglu"}
 )
 
 
@@ -464,6 +470,13 @@ _CHECKPOINT_SAVED_ALIASES = (
     "fc2_weight",
     "fc2_bias",
 )
+
+
+def _drop_rowwise_data(tensor: Any) -> None:
+    """The backward only reads a saved GEMM input column-wise (weight gradient), so the
+    row-wise copy of a tensor quantized with both usages is dead weight in the saved context."""
+    if isinstance(tensor, QuantizedTensorStorage) and getattr(tensor, "_columnwise_data", None) is not None:
+        tensor.update_usage(rowwise_usage=False, columnwise_usage=True)
 
 
 def _layernorm_mlp_forward_impl(
@@ -949,6 +962,9 @@ def _layernorm_mlp_forward_impl(
         if not fc2_weight_requires_grad:
             clear_tensor_data(act_out)
             act_out = None
+        if not sequence_parallel and not (return_layernorm_output and with_quantized_norm):
+            _drop_rowwise_data(ln_out)
+        _drop_rowwise_data(act_out)
 
         fsdp_shapes = None
         if not checkpoint:  # regular path, no selective activation checkpointing
@@ -2349,6 +2365,19 @@ def _layernorm_mlp_forward_fake(
             and not ln_out_rebound
             else None
         )
+        # Mirror the impl's ``_drop_rowwise_data`` on the saved activation specs.
+        if (
+            ln_out is not None
+            and ln_out_alias is None
+            and not args.sequence_parallel
+            and ln_out.is_quantized
+            and ln_out.quantizer.columnwise_usage
+        ):
+            ln_out = dataclass_replace(ln_out)
+            ln_out.update_usage(rowwise_usage=False, columnwise_usage=True)
+        if act_out is not None and act_out.is_quantized and act_out.quantizer.columnwise_usage:
+            act_out = dataclass_replace(act_out)
+            act_out.update_usage(rowwise_usage=False, columnwise_usage=True)
         saved_tensor_aliases = (
             "inp" if inputmat_aliases_inp else None,
             "ln_weight" if ln_weight_aliases else None,
@@ -2646,7 +2675,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                    type of normalization applied.
     activation : str, default = 'gelu'
           activation function used.
-          Options: ``'gelu'``, ``'geglu'``, ``'glu'``, ``'qgelu'``, ``'qgeglu'``, ``'relu'``, ``'reglu'``, ``'srelu'``, ``'sreglu'``,
+          Options: ``'gelu'``, ``'geglu'``, ``'gelu_erf'``, ``'geglu_erf'``, ``'glu'``, ``'qgelu'``, ``'qgeglu'``, ``'relu'``, ``'reglu'``, ``'srelu'``, ``'sreglu'``,
           ``'silu'``, ``'swiglu'``, and ``'clamped_swiglu'``.
     activation_params : dict, default = None
                         Additional parameters for the activation function.
@@ -2890,6 +2919,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
         # FC1 init
         if self.activation in [
             "geglu",
+            "geglu_erf",
             "glu",
             "qgeglu",
             "reglu",
@@ -3432,11 +3462,11 @@ class LayerNormMLP(TransformerEngineBaseModule):
         ) = [None] * 10
         fc1_weight_quantizer, fc2_weight_quantizer = self._get_weight_quantizers()
         if self.fp8 or self.fp8_calibration:
-            fc1_input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+            fc1_input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_INPUT)
             fc1_input_quantizer.internal = True
             if not self.sequence_parallel:
                 fc1_input_quantizer.optimize_for_gemm = True
-            fc2_input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_INPUT]
+            fc2_input_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_INPUT)
             fc2_input_quantizer.set_usage(
                 rowwise=True,
                 columnwise=isinstance(
@@ -3447,17 +3477,17 @@ class LayerNormMLP(TransformerEngineBaseModule):
             fc2_input_quantizer.internal = True
             fc2_input_quantizer.optimize_for_gemm = True
             if fp8_output:
-                fc2_output_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_OUTPUT]
+                fc2_output_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_OUTPUT)
             if is_grad_enabled:
-                fc2_grad_output_quantizer = self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT2
-                ]
+                fc2_grad_output_quantizer = self._call_quantizer(
+                    "scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT2
+                )
                 fc2_grad_output_quantizer.internal = True
                 if not self.sequence_parallel:
                     fc2_grad_output_quantizer.optimize_for_gemm = True
-                fc1_grad_output_quantizer = self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT1
-                ]
+                fc1_grad_output_quantizer = self._call_quantizer(
+                    "scaling_bwd", FP8BwdTensorIdx.GRAD_OUTPUT1
+                )
                 fc1_grad_output_quantizer.internal = True
                 fc1_grad_output_quantizer.optimize_for_gemm = True
 
@@ -3548,6 +3578,8 @@ class LayerNormMLP(TransformerEngineBaseModule):
         activation_map = {
             "gelu": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
             "geglu": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
+            "gelu_erf": torch.nn.functional.gelu,
+            "geglu_erf": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
             "glu": lambda x: torch.sigmoid(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
             "qgelu": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
             "qgeglu": lambda x: torch.nn.functional.gelu(x.chunk(2, -1)[0], approximate="tanh")
@@ -3668,9 +3700,9 @@ class LayerNormMLP(TransformerEngineBaseModule):
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
             return [None, None]
-        fc1_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+        fc1_weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM1_WEIGHT)
         fc1_weight_quantizer.internal = True
-        fc2_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_WEIGHT]
+        fc2_weight_quantizer = self._call_quantizer("scaling_fwd", FP8FwdTensorIdx.GEMM2_WEIGHT)
         fc2_weight_quantizer.internal = True
         return [fc1_weight_quantizer, fc2_weight_quantizer]
 

@@ -111,9 +111,6 @@ if(NOT arch_100_index EQUAL -1)
   list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES "100")
   list(APPEND NVTE_GENERIC_ARCHS "100")
   list(APPEND NVTE_SPECIFIC_ARCHS "100a")
-  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
-    list(APPEND NVTE_SPECIFIC_ARCHS "103a")
-  endif()
   if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.4)
     list(APPEND NVTE_SPECIFIC_ARCHS "107a")
   endif()
@@ -374,6 +371,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      hadamard_transform/group_row_cast_col_hadamard_transform_cast_fusion.cu
      hadamard_transform/graph_safe_group_row_cast_col_hadamard_transform_cast_fusion.cu
      multi_tensor/compute_scale.cu
+     normalization/layernorm/ln_fwd_mxfp8.cu
      normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu
      recipe/mxfp8_scaling.cu
      recipe/nvfp4.cu

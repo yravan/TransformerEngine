@@ -54,6 +54,16 @@ class OperationContext:
     # Whether backward pass is required
     requires_grad: bool = True
 
+    """Quantizers of this forward call, published by ``pre_fuser_forward``.
+
+    The input and grad-output ones are read by the neighbouring ops, the weight
+    one by the op itself and by the fusions containing it. ``None`` where the
+    op has none.
+    """
+    input_quantizer: Optional[Quantizer] = None
+    weight_quantizer: Optional[Quantizer] = None
+    grad_output_quantizer: Optional[Quantizer] = None
+
     def save_for_backward(self, *tensors: Optional[torch.Tensor]) -> None:
         """Register tensors to be saved for the backward function
 
@@ -133,12 +143,17 @@ class FusibleOperation(torch.nn.Module, metaclass=abc.ABCMeta):
                     "Call reset_parameters() before the first forward pass."
                 )
 
-    def pre_fuser_forward(
-        self,
-        *,
-        requires_grad: bool,  # pylint: disable=unused-argument
-    ) -> None:
-        """Preprocessing before fuser forward pass"""
+    def pre_fuser_forward(self, ctx: OperationContext) -> None:
+        """Prepare the context of one forward call.
+
+        Publishes the quantizers the call uses on ``ctx`` so that neighbouring
+        ops can quantize into their layout early. The default publishes the
+        op's recipe quantizers as they are; an op whose usage depends on the
+        call (``BasicLinear``) publishes configured copies instead, so a call
+        never mutates the recipe state a compiled graph guards on.
+        """
+        ctx.input_quantizer = self.get_input_quantizer()
+        ctx.grad_output_quantizer = self.get_grad_output_quantizer()
 
     def get_input_quantizer(self) -> Optional[Quantizer]:
         """Get builder class for quantized input tensor"""
@@ -1010,10 +1025,6 @@ class FusedOperation(FusibleOperation):
     def pre_first_fuser_forward(self) -> None:
         for op in self.basic_ops:
             op.pre_first_fuser_forward()
-
-    def pre_fuser_forward(self, *, requires_grad: bool) -> None:
-        for op in self.basic_ops:
-            op.pre_fuser_forward(requires_grad=requires_grad)
 
     def forward(
         self,

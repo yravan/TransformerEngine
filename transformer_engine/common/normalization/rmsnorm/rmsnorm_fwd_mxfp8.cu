@@ -286,10 +286,6 @@ __global__ void __launch_bounds__(kThreads)
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
-bool is_aligned_to(const void *ptr, size_t alignment) {
-  return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
-}
-
 // Rows per launch of a kernel with grid rows of grid_cols CTAs, each grid row covering cta_rows
 // rows: all rows, unless the caller reserves SMs for other work. Then a launch runs at most as
 // many CTAs as fit on the remaining num_sms SMs, in multiples of 128 rows (at least 128).

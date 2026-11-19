@@ -426,19 +426,19 @@ def _load_cuda_library_from_system(lib_name: str):
 def _load_cuda_library(lib_name: str):
     """
     Load given shared library.
-    Prioritize loading from system/toolkit
-    before checking python packages.
+    Prioritize the python packages (the ones the framework wheel was
+    built against) before checking the system/toolkit.
     """
-
-    # Attempt to locate library in system.
-    found, handle = _load_cuda_library_from_system(lib_name)
-    if found:
-        return True, handle
 
     # Attempt to locate library in Python dist-packages.
     found, handle = _load_cuda_library_from_python(lib_name)
     if found:
         return False, handle
+
+    # Attempt to locate library in system.
+    found, handle = _load_cuda_library_from_system(lib_name)
+    if found:
+        return True, handle
 
     raise RuntimeError(f"{lib_name} shared object not found.")
 

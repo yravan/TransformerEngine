@@ -81,10 +81,10 @@ class ForwardLinearBiasAdd(FusedOperation):
         weight_requires_grad = linear_op_ctx.requires_grad and linear_op.weight.requires_grad
 
         # Quantizers
-        input_quantizer = linear_op.get_quantizer("forward", 0)
-        weight_quantizer = linear_op.get_quantizer("forward", 1)
+        input_quantizer = linear_op_ctx.input_quantizer
+        weight_quantizer = linear_op_ctx.weight_quantizer
         output_quantizer = None
-        grad_output_quantizer = linear_op.get_quantizer("backward", 0)
+        grad_output_quantizer = linear_op_ctx.grad_output_quantizer
         grad_input_quantizer = prev_op_grad_output_quantizer
         with_quantized_compute = FP8GlobalStateManager.is_fp8_enabled()
         if with_quantized_compute:
@@ -140,7 +140,7 @@ class ForwardLinearBiasAdd(FusedOperation):
             linear_op_ctx.weight_requires_grad = weight_requires_grad
         if bias_op is not None and bias_op_ctx.requires_grad:
             bias_op_ctx.grad_input_quantizer = (
-                None if backward_override is not None else linear_op.get_grad_output_quantizer()
+                None if backward_override is not None else linear_op_ctx.grad_output_quantizer
             )
 
         return output, [() for _ in range(len(self.basic_ops))]

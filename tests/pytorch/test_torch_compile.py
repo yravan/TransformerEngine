@@ -1107,6 +1107,55 @@ def _compare_compiled_to_eager(
     _assert_run_matches(compiled, eager, backend, dtype)
 
 
+@pytest.mark.parametrize("backend", ["flash", "fused"])
+def test_dpa_torch_compile_dynamic(monkeypatch, backend):
+    """`torch.compile(dynamic=True)` hands the module symbolic scalars: the
+    sequence lengths follow the input shape and have to reach the custom op as
+    SymInts, and every configuration scalar (the softmax scale, the window) has
+    to be specialized rather than baked into the opaque constant bundle.
+
+    Backend selection takes the batch size and the sequence lengths as constants
+    (``assume_constant_result``), so the module specializes them before selecting;
+    ``fullgraph=True`` makes the test fail if that specialization ever regresses
+    into a graph break."""
+    dtype = torch.bfloat16
+    spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
+    module = _make_dpa(spec, dtype)
+    args, kwargs, grads = _make_dpa_inputs(spec, dtype)
+    _skip_unsupported(spec, backend, dtype)
+    _compare_compiled_to_eager(
+        module, args, kwargs, grads, monkeypatch, backend, dtype, dynamic=True, fullgraph=True
+    )
+
+
+@pytest.mark.parametrize("backend", ["flash", "fused"])
+def test_dpa_compile_alternating_batch_sizes(monkeypatch, backend):
+    """Callers with two batch sizes alternate through one compiled DotProductAttention:
+    one graph per batch size, then cache hits. Eager calls memoize backend selection in
+    a process-global cache; a compiled call must not read it, or its graph guards on
+    whichever call ran last and recompiles on every switch. One eager call first, as
+    every compile here: it settles the module's lazily set state (activation dtype), which
+    a cold compiled call would otherwise bake into its first graph and recompile once."""
+    dtype = torch.bfloat16
+    spec = _DPA_COMPILE_CONFIGS["self_bshd_causal"]
+    _skip_unsupported(spec, backend, dtype)
+    _force_dpa_backend(monkeypatch, backend)
+    module = _make_dpa(spec, dtype)
+    config = spec["model_config"]
+
+    def qkv(batch_size):
+        shape = (batch_size, config.max_seqlen_q, config.num_heads, config.head_dim_qk)
+        return [torch.randn(shape, dtype=dtype, device="cuda") for _ in range(3)]
+
+    module(*qkv(2))
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("eager")
+    compiled = torch.compile(module, backend=counter, fullgraph=True)
+    for batch_size in (2, 4, 2, 4, 2, 4):
+        compiled(*qkv(batch_size))
+    assert counter.frame_count == 2
+
+
 @pytest.mark.parametrize("backend", ["flash", "fused", "unfused"])
 @pytest.mark.parametrize("config", _DPA_COMPILE_CONFIGS.keys())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -2435,6 +2484,135 @@ def test_te_linear_compile_delayed_scaling_raises():
 
 
 @pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
+@pytest.mark.parametrize("backend", ["inductor", "eager"])
+@pytest.mark.parametrize("cache_quantized_input", [False, True])
+@pytest.mark.parametrize(
+    "fp8_recipe",
+    [
+        pytest.param(None, id="bf16"),
+        pytest.param(
+            recipe.Float8CurrentScaling(),
+            id="current",
+            marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8),
+        ),
+        pytest.param(
+            recipe.MXFP8BlockScaling(),
+            id="mxfp8",
+            marks=pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8),
+        ),
+    ],
+)
+def test_te_ops_swiglu_compiles_fullgraph(fp8_recipe, cache_quantized_input, backend):
+    """te.ops.SwiGLU has forward and backward custom ops, so Linear -> SwiGLU -> Linear
+    compiles as one graph under every value-opaque recipe, with the saved input kept or
+    quantized, and matches eager. The eager warm-up builds the recipe state the compiled
+    call reads. The ``eager`` backend runs the traced graph as it is, so each op's real
+    kernel takes the quantized tensor its neighbour produced directly."""
+    dtype, device = torch.bfloat16, "cuda"
+    torch.manual_seed(0)
+
+    def make():
+        return te.ops.Sequential(
+            te.ops.Linear(64, 64, dtype=dtype, device=device),
+            te.ops.SwiGLU(cache_quantized_input=cache_quantized_input),
+            te.ops.Linear(32, 64, dtype=dtype, device=device),
+        )
+
+    def autocast():
+        if fp8_recipe is None:
+            return contextlib.nullcontext()
+        return te.autocast(recipe=fp8_recipe)
+
+    def step(fn, inp):
+        x = inp.clone().requires_grad_(True)
+        with autocast():
+            out = fn(x)
+        out.sum().backward()
+        return out, x.grad
+
+    model, ref = make(), make()
+    ref.load_state_dict(model.state_dict())
+    inp = torch.randn(32, 64, dtype=dtype, device=device)
+    step(model, inp)
+    step(ref, inp)
+    for param in (*model.parameters(), *ref.parameters()):
+        param.grad = None
+    torch._dynamo.reset()
+    compiled = torch.compile(model, fullgraph=True, backend=backend)
+    for _ in range(2):
+        inp = torch.randn(32, 64, dtype=dtype, device=device)
+        out_c, dx_c = step(compiled, inp)
+        out_r, dx_r = step(ref, inp)
+        torch.testing.assert_close(out_c, out_r, atol=0, rtol=0)
+        torch.testing.assert_close(dx_c, dx_r, atol=0, rtol=0)
+        for p_c, p_r in zip(model.parameters(), ref.parameters()):
+            torch.testing.assert_close(p_c.grad, p_r.grad, atol=0, rtol=0)
+
+
+_shared_code_recipes = [
+    pytest.param(
+        recipe.Float8CurrentScaling(),
+        marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8),
+    ),
+    pytest.param(
+        recipe.MXFP8BlockScaling(),
+        marks=pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8),
+    ),
+]
+
+
+def _graphs_across_instances(make, fp8_recipe, in_features):
+    """Compile three instances of ``make()`` separately, after one eager step each, and
+    return the number of graphs dynamo built over two training steps of every instance."""
+    dtype, device = torch.bfloat16, "cuda"
+    torch.manual_seed(0)
+    models = [make() for _ in range(3)]
+
+    def step(model):
+        x = torch.randn(32, in_features, dtype=dtype, device=device, requires_grad=True)
+        with te.autocast(recipe=fp8_recipe):
+            out = model(x)
+        out.sum().backward()
+
+    for model in models:
+        step(model)
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("aot_eager")
+    compiled = [torch.compile(model, backend=counter, fullgraph=True) for model in models]
+    for _ in range(2):
+        for model in compiled:
+            step(model)
+    return counter.frame_count
+
+
+@pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
+@pytest.mark.parametrize("fp8_recipe", _shared_code_recipes, ids=recipe_id)
+@pytest.mark.parametrize("module", _LINEAR_MODULES)
+def test_te_modules_compile_once_across_instances(module, fp8_recipe):
+    """One compiled forward serves every instance of a module class. A call configures
+    copies of the stored quantizers, so the guards on the stored ones (equality on their
+    recipe state) hold across instances and across the usage flips between forward and
+    backward; configuring them in place recompiled once per instance up to the limit."""
+    assert _graphs_across_instances(lambda: _make_module(module), fp8_recipe, 64) == 1
+
+
+@pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
+@pytest.mark.parametrize("fp8_recipe", _shared_code_recipes, ids=recipe_id)
+def test_te_ops_compile_once_across_instances(fp8_recipe):
+    """Same for te.ops: a call's quantizers live on its OperationContext, never on the op."""
+    dtype, device = torch.bfloat16, "cuda"
+
+    def make():
+        return te.ops.Sequential(
+            te.ops.Linear(64, 64, bias=True, dtype=dtype, device=device),
+            te.ops.SwiGLU(),
+            te.ops.Linear(32, 64, bias=True, dtype=dtype, device=device),
+        )
+
+    assert _graphs_across_instances(make, fp8_recipe, 64) == 1
+
+
+@pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
 @pytest.mark.parametrize("compile_mode", _compile_modes)
 @pytest.mark.parametrize("deferred_backward", [False, True])
 @pytest.mark.parametrize(
@@ -3522,8 +3700,10 @@ def test_te_ops_linear_saved_fp8_dtype_with_autocast(input_dtype, weight_dtype):
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         with te.autocast(recipe=fp8_recipe):
+            ctx = OperationContext()
+            model.pre_fuser_forward(ctx)
             args = model.pack_forward_args(
-                [OperationContext()],
+                [ctx],
                 x,
                 prev_op_grad_output_quantizer=None,
                 next_op_input_quantizer=None,

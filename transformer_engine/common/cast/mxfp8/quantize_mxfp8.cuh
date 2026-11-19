@@ -30,6 +30,20 @@
 namespace transformer_engine {
 namespace dispatch {
 namespace mxfp8 {
+
+// Inverse RoPE applied to the input while it is quantized: the input is the gradient of a packed
+// projection whose first `cols` columns are attention heads of `head_dim` rotated by RoPE; pairs
+// (2i, 2i+1) of a head with 2i < rot_dim are rotated back with row (row % seq_len) of the
+// [seq_len, rot_dim] FP32 cos/sin tables.
+struct RopeParams {
+  const float *cos = nullptr;
+  const float *sin = nullptr;
+  uint32_t seq_len = 0;
+  uint32_t rot_dim = 0;
+  uint32_t head_dim = 0;
+  uint32_t cols = 0;
+};
+
 namespace quantize_kernel {
 
 constexpr size_t SCALE_DIM_Y = 32;
@@ -45,10 +59,87 @@ constexpr size_t TOTAL_BANKS_WIDTH = (32 * 4) / 1;  // 128
 // Number of threads (rowwise scaling) that span 32 banks (4-byte banks) of shared memory
 constexpr size_t THREADS_PER_BANK = TOTAL_BANKS_WIDTH / SCALE_DIM_X;  // 4 = 128 / 32
 
+// Inverse RoPE (the transpose of the forward rotation) on a [BUFF_DIM_Y x BUFF_DIM_X] input tile in
+// shared memory, in place: FP32 math on the upcast input, rounded back to IType, so the quantization
+// that follows sees the same values as a separate rotation kernel's output. Pairs past rot_dim go
+// through the same arithmetic with cos = 1 and sin = 0. Each thread owns VEC consecutive columns of
+// a row in every SPAN-column slice of the tile; the slices hold the same head positions (the
+// launcher checks that SPAN is a multiple of head_dim), so every cos/sin value read serves
+// BUFF_DIM_X / SPAN heads.
+template <typename IType, size_t BUFF_DIM_Y, size_t BUFF_DIM_X, size_t THREADS>
+struct RopeTile {
+  static constexpr uint32_t VEC = 8;
+  static constexpr uint32_t SPAN = 64;
+  static constexpr uint32_t SLICES = BUFF_DIM_X / SPAN;
+  static constexpr uint32_t VECS_X = SPAN / VEC;
+  static constexpr uint32_t ROWS_PER_ITER = THREADS / VECS_X;
+  static constexpr uint32_t ITERS = BUFF_DIM_Y / ROWS_PER_ITER;
+  static_assert(BUFF_DIM_X % SPAN == 0 && THREADS % VECS_X == 0 &&
+                BUFF_DIM_Y % ROWS_PER_ITER == 0);
+
+  uint32_t d;
+  uint32_t n0;
+  uint32_t row;
+  uint32_t col;
+
+  __device__ __forceinline__ void init(const uint32_t row0, const uint32_t col0,
+                                       const RopeParams &rope) {
+    row = threadIdx.x / VECS_X;
+    col = (threadIdx.x % VECS_X) * VEC;
+    d = (col0 + col) % rope.head_dim;
+    n0 = (row0 + row) % rope.seq_len;
+  }
+
+  __device__ __forceinline__ static void rotate(IType &e, IType &o, const float ce, const float co,
+                                                const float se, const float so) {
+    const float xe = static_cast<float>(e);
+    const float xo = static_cast<float>(o);
+    e = static_cast<IType>(__fmaf_rn(xe, ce, __fmul_rn(xo, so)));
+    o = static_cast<IType>(__fmaf_rn(xo, co, -__fmul_rn(xe, se)));
+  }
+
+  // Rotates the stage whose first row is stage_row rows below the CTA's first row.
+  __device__ __forceinline__ void apply(IType *tile, const uint32_t stage_row,
+                                        const RopeParams &rope) const {
+#pragma unroll
+    for (uint32_t it = 0; it < ITERS; ++it) {
+      uint32_t n = n0 + stage_row + it * ROWS_PER_ITER;
+      while (n >= rope.seq_len) {
+        n -= rope.seq_len;
+      }
+      IType *ptr = &tile[(row + it * ROWS_PER_ITER) * BUFF_DIM_X + col];
+      Vec<IType, VEC> x[SLICES];
+#pragma unroll
+      for (uint32_t k = 0; k < SLICES; ++k) {
+        x[k].load_from(ptr + k * SPAN);
+      }
+#pragma unroll
+      for (uint32_t h = 0; h < 2; ++h) {
+        float4 c = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+        float4 sn = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (d + 4 * h < rope.rot_dim) {
+          const uint32_t idx = n * rope.rot_dim + d + 4 * h;
+          c = __ldg(reinterpret_cast<const float4 *>(rope.cos + idx));
+          sn = __ldg(reinterpret_cast<const float4 *>(rope.sin + idx));
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < SLICES; ++k) {
+          rotate(x[k].data.elt[4 * h], x[k].data.elt[4 * h + 1], c.x, c.y, sn.x, sn.y);
+          rotate(x[k].data.elt[4 * h + 2], x[k].data.elt[4 * h + 3], c.z, c.w, sn.z, sn.w);
+        }
+      }
+#pragma unroll
+      for (uint32_t k = 0; k < SLICES; ++k) {
+        x[k].store_to(ptr + k * SPAN);
+      }
+    }
+  }
+};
+
 template <bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &), typename IType, typename OType, bool ROWWISE_SCALING,
           bool COLWISE_SCALING, bool WITH_GEMM_SWIZZLED_SCALES, size_t CHUNK_DIM_Y,
-          size_t CHUNK_DIM_X, size_t THREADS_PER_CHUNK, bool kIs2DBlockScaling>
+          size_t CHUNK_DIM_X, size_t THREADS_PER_CHUNK, bool kIs2DBlockScaling, bool ROPE = false>
 __global__ void __launch_bounds__(THREADS_PER_CHUNK)
     quantize_mxfp8_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                           const __grid_constant__ CUtensorMap tensor_map_act_input,
@@ -57,7 +148,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
                           e8m0_t *const scales_rowwise, e8m0_t *const scales_colwise,
                           const float *noop, float *const dbias_workspace, float *const amax_ptr,
                           const size_t rows, const size_t cols, const size_t scale_stride_rowwise,
-                          const size_t scale_stride_colwise) {
+                          const size_t scale_stride_colwise, const RopeParams rope) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool COMPUTE_ACTIVATIONS = IS_DACT || IS_ACT;
   constexpr bool NO_ACTIVATIONS = !COMPUTE_ACTIVATIONS;
@@ -70,6 +161,22 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
   if constexpr (NO_ACTIVATIONS && !IS_DBIAS) {
     if (noop != nullptr && noop[0] == 1.0f) {
       return;
+    }
+  }
+  if constexpr (WITH_GEMM_SWIZZLED_SCALES) {
+    using transformer_engine::dispatch::mxfp8::swizzle::zero_gemm_swizzled_scale_padding;
+    const size_t worker =
+        (static_cast<size_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t num_workers = static_cast<size_t>(gridDim.x) * gridDim.y * blockDim.x;
+    if constexpr (ROWWISE_SCALING) {
+      zero_gemm_swizzled_scale_padding(scales_rowwise, rows,
+                                       (cols + SCALE_DIM_X - 1) / SCALE_DIM_X, worker,
+                                       num_workers);
+    }
+    if constexpr (COLWISE_SCALING) {
+      zero_gemm_swizzled_scale_padding(scales_colwise, cols,
+                                       (rows + SCALE_DIM_Y - 1) / SCALE_DIM_Y, worker,
+                                       num_workers);
     }
   }
   constexpr size_t THREADS_X = CHUNK_DIM_X / SCALE_DIM_X;
@@ -189,6 +296,12 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 
   initialize_barriers<STAGES, THREADS_PER_CHUNK>(mbar, is_master_thread);
 
+  const bool rope_block = ROPE && block_offset_X < rope.cols;
+  RopeTile<IType, BUFF_DIM_Y, BUFF_DIM_X, THREADS_PER_CHUNK> rope_tile;
+  if (rope_block) {
+    rope_tile.init(block_offset_Y, block_offset_X, rope);
+  }
+
   int parity = 0;
 
   if constexpr (IS_DACT) {
@@ -237,6 +350,11 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 
     // Wait for the data to have arrived
     ptx::mbarrier_wait_parity(&mbar[stage], parity);
+
+    if (rope_block) {
+      rope_tile.apply(&in_sh[buff * BUFF_DIM], stage_offset_Y, rope);
+      __syncthreads();
+    }
 
     float thread_amax = 0.0f;
     if constexpr (COLWISE_SCALING) {
@@ -667,7 +785,7 @@ template <bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &)>
 void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,  // TODO (ksivamani)
               Tensor *output, Tensor *dbias, Tensor *workspace, const bool use_2d_quantization,
-              cudaStream_t stream) {
+              cudaStream_t stream, const RopeParams &rope = {}) {
   using namespace quantize_kernel;
   checkCuDriverContext(stream);
 
@@ -685,6 +803,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
   CheckNoopTensor(*noop, "cast_noop");
 
   constexpr bool CAST_DBIAS_ONLY = IS_DBIAS && (!IS_DACT) && (!IS_ACT);
+  const bool with_rope = rope.cos != nullptr;
+  // The RoPE variant takes 256-column chunks (one thread per column, as in the kernel's colwise
+  // pass), so each cos/sin value it reads serves four 64-wide heads.
+  constexpr size_t ROPE_CHUNK_DIM_X = 256;
 
   // Tensor dimensions
   const auto [rows, cols] = input.flat_2d_dims();
@@ -716,7 +838,17 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
       use_rowwise_scaling ? reinterpret_cast<e8m0_t *>(output->scale_inv.dptr) : nullptr;
   e8m0_t *const scales_colwise_ptr =
       use_colwise_scaling ? reinterpret_cast<e8m0_t *>(output->columnwise_scale_inv.dptr) : nullptr;
-  const size_t dbias_rows = blocks_Y;
+  constexpr bool COMPUTE_ACTIVATIONS = IS_DACT || IS_ACT;
+  const bool bidimensional_activation_shape =
+      COMPUTE_ACTIVATIONS && use_rowwise_scaling && use_colwise_scaling && !use_2d_quantization &&
+      rows % specialized::kBidimRows == 0 && cols % specialized::kBidimCols == 0;
+  const bool register_resident_activation =
+      bidimensional_activation_shape && input.dtype() == DType::kBFloat16 &&
+      transformer_engine::cuda::sm_arch() >= 100 && is_aligned_ptr(input.data.dptr, 32) &&
+      (!IS_DACT || is_aligned_ptr(act_input->data.dptr, 32));
+  const size_t dbias_rows_capacity =
+      bidimensional_activation_shape ? rows / specialized::kBidimRows : blocks_Y;
+  const size_t dbias_rows = register_resident_activation ? rows / specialized::kBidimRows : blocks_Y;
   const size_t dbias_cols = cols;
 
   ScalingType scaling_type;
@@ -728,13 +860,26 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
     scaling_type = ScalingType::BIDIMENSIONAL;
   }
 
+  if (with_rope) {
+    NVTE_CHECK(CAST_DBIAS_ONLY, "RoPE backward is fused only into the dbias quantize.");
+    NVTE_CHECK(input.dtype() == DType::kBFloat16, "RoPE backward needs a BF16 input.");
+    NVTE_CHECK(scaling_type == ScalingType::BIDIMENSIONAL && !use_2d_quantization,
+               "RoPE backward needs rowwise and columnwise 1D scaling.");
+    NVTE_CHECK(is_aligned_ptr(rope.cos, 16) && is_aligned_ptr(rope.sin, 16),
+               "RoPE tables must be 16-byte aligned.");
+    NVTE_CHECK(rope.head_dim % 8 == 0 && rope.rot_dim % 4 == 0 && rope.rot_dim <= rope.head_dim &&
+                   rope.cols % ROPE_CHUNK_DIM_X == 0 && 64 % rope.head_dim == 0 &&
+                   rope.cols <= cols && rope.seq_len > 0,
+               "Unsupported RoPE layout.");
+  }
+
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.dtype(), "DBias must have the same type as input.");
     NVTE_CHECK(dbias->data.shape == Shape{cols}, "Wrong shape of DBias.");
     NVTE_CHECK(workspace != nullptr, "Workspace must be a tensor.");
 
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {dbias_rows, dbias_cols};
+      workspace->data.shape = {dbias_rows_capacity, dbias_cols};
       workspace->data.dtype = DType::kFloat32;
       return;
     }
@@ -749,9 +894,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
   const float *const noop_ptr =
       (NO_ACTIVATIONS && !IS_DBIAS) ? reinterpret_cast<const float *>(noop->data.dptr) : nullptr;
 
-  // Clear padding before either the generic or specialized kernel writes
-  // directly into the GEMM-swizzled scale layout.
-  if (with_gemm_swizzled_scales && (cols % 128 != 0 || rows % 128 != 0)) {
+  const auto zero_scale_padding = [&]() {
+    if (!with_gemm_swizzled_scales || (cols % 128 == 0 && rows % 128 == 0)) {
+      return;
+    }
     constexpr size_t zero_threads = 256;
     if (use_rowwise_scaling) {
       const size_t size_bytes = output->scale_inv.buffer_size_bytes();
@@ -771,7 +917,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
         NVTE_CHECK_CUDA(cudaGetLastError());
       }
     }
-  }
+  };
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
       input.dtype(), IType,
@@ -812,13 +958,33 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                   (transformer_engine::cuda::sm_arch() >= 100) &&
                   is_aligned_ptr(input.data.dptr, 32);
 
+              if constexpr (COMPUTE_ACTIVATIONS && std::is_same_v<IType, bf16>) {
+                if (register_resident_activation) {
+                  zero_scale_padding();
+                  specialized::launch_cast_bidim<OType, WITH_GEMM_SWIZZLED_SCALES, IS_DBIAS, IS_DACT,
+                                                 IS_ACT, ParamOP, OP>(
+                      input.data.dptr, IS_DACT ? act_input->data.dptr : nullptr, output->data.dptr,
+                      reinterpret_cast<void *>(scales_rowwise_ptr), output->columnwise_data.dptr,
+                      reinterpret_cast<void *>(scales_colwise_ptr), workspace_ptr,
+                      static_cast<int>(rows), static_cast<int>(cols),
+                      static_cast<int>(scale_stride_rowwise),
+                      static_cast<int>(scale_stride_colwise), stream);
+                  if constexpr (IS_DBIAS) {
+                    common::reduce_dbias<IType>(workspace_ptr, dbias, dbias_rows, dbias_cols,
+                                                stream);
+                  }
+                  return;
+                }
+              }
+
               // Specialized cast-only kernels do not consume the device noop flag.
               // Preserve cached outputs by keeping noop-aware calls on the generic path.
-              if (noop_ptr == nullptr &&
+              if (noop_ptr == nullptr && !with_rope &&
                   specialized::hasSpec<IS_DBIAS, IS_DACT, IS_ACT, IType, OType>() &&
                   !use_2d_quantization && scaling_type_has_specialized_support) {
                 switch (scaling_type) {
                   case ScalingType::ROWWISE: {
+                    zero_scale_padding();
                     // The register-resident kernel supersedes the staged one below
                     // wherever it applies.
                     // hasSpec has already established cast-only, leaving the input
@@ -876,12 +1042,13 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                                    "Specialized bidimensional MXFP8 cast cannot emit GEMM-swizzled "
                                    "scales; the colwise direction is unimplemented and a "
                                    "half-swizzled tensor would be unreadable.");
-                        specialized::launch_cast_bidim<OType>(
-                            input.data.dptr, output->data.dptr,
+                        specialized::launch_cast_bidim<OType, false>(
+                            input.data.dptr, nullptr, output->data.dptr,
                             reinterpret_cast<void *>(scales_rowwise_ptr),
                             output->columnwise_data.dptr,
-                            reinterpret_cast<void *>(scales_colwise_ptr), static_cast<int>(rows),
-                            static_cast<int>(cols), static_cast<int>(scale_stride_rowwise),
+                            reinterpret_cast<void *>(scales_colwise_ptr), nullptr,
+                            static_cast<int>(rows), static_cast<int>(cols),
+                            static_cast<int>(scale_stride_rowwise),
                             static_cast<int>(scale_stride_colwise), stream);
                         break;
                       }
@@ -944,6 +1111,40 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
               constexpr size_t input_type_bit_size = TypeInfo<IType>::size;
               constexpr size_t output_type_bit_size = TypeInfo<OType>::size;
 
+              if constexpr (CAST_DBIAS_ONLY && std::is_same_v<IType, bf16>) {
+                if (with_rope) {
+                  constexpr size_t ROPE_THREADS = ROPE_CHUNK_DIM_X;
+                  create_2D_tensor_map(tensor_map_input, input.data, rows, cols, BUFF_DIM_Y,
+                                       ROPE_CHUNK_DIM_X, cols, 0, input_type_bit_size);
+                  create_2D_tensor_map(tensor_map_output_rowwise, output->data, rows, cols,
+                                       BUFF_DIM_Y, ROPE_CHUNK_DIM_X, cols, 0, output_type_bit_size);
+                  create_2D_tensor_map(tensor_map_output_colwise, output->columnwise_data, rows,
+                                       cols, BUFF_DIM_Y, ROPE_CHUNK_DIM_X, cols, 0,
+                                       output_type_bit_size);
+                  constexpr size_t rope_buff_elems = BUFFS_NUM * BUFF_DIM_Y * ROPE_CHUNK_DIM_X;
+                  constexpr size_t rope_in_mem = DIVUP_TO_MULTIPLE(
+                      rope_buff_elems * input_type_bit_size / 8, TMA_SHMEM_ALIGNMENT);
+                  constexpr size_t rope_out_mem = DIVUP_TO_MULTIPLE(
+                      rope_buff_elems * output_type_bit_size / 8, TMA_SHMEM_ALIGNMENT);
+                  const size_t rope_dshmem_size = rope_in_mem + 2 * rope_out_mem + TMA_SHMEM_ALIGNMENT;
+                  auto kernel =
+                      quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType, OType,
+                                            true, true, WITH_GEMM_SWIZZLED_SCALES, CHUNK_DIM_Y,
+                                            ROPE_CHUNK_DIM_X, ROPE_THREADS, false, true>;
+                  NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, rope_dshmem_size));
+                  const dim3 rope_grid(DIVUP(cols, ROPE_CHUNK_DIM_X), blocks_Y);
+                  kernel<<<rope_grid, ROPE_THREADS, rope_dshmem_size, stream>>>(
+                      tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                      tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
+                      workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+                      scale_stride_colwise, rope);
+                  NVTE_CHECK_CUDA(cudaGetLastError());
+                  common::reduce_dbias<IType>(workspace_ptr, dbias, dbias_rows, dbias_cols, stream);
+                  return;
+                }
+              }
+
               create_2D_tensor_map(tensor_map_input, input.data, rows, cols, BUFF_DIM_Y, BUFF_DIM_X,
                                    cols, 0, input_type_bit_size);
 
@@ -995,7 +1196,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                         tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
                         tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
                         workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
-                        scale_stride_colwise);
+                        scale_stride_colwise, rope);
                   });
                   break;
                 }
@@ -1012,7 +1213,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                         tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
                         tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
                         workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
-                        scale_stride_colwise);
+                        scale_stride_colwise, rope);
                   });
                   break;
                 }
@@ -1029,7 +1230,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                         tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
                         tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
                         workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
-                        scale_stride_colwise);
+                        scale_stride_colwise, rope);
                   });
                   break;
                 }
