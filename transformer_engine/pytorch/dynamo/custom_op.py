@@ -979,9 +979,9 @@ def _register_base_op(
     fake_impl: Callable[[Any], Any],
     pack_result: Callable[[Any], List[torch.Tensor]],
     tags: Sequence[torch.Tag] = (),
-) -> Any:
+) -> Tuple[Any, Callable[..., List[torch.Tensor]]]:
     """Define the op via ``torch.library.custom_op`` with the real ``impl`` + the
-    ``fake_impl`` (spec), returning the ``CustomOpDef``.
+    ``fake_impl`` (spec), returning the ``CustomOpDef`` and its real kernel.
 
     The real kernel rebuilds the dataclass and runs ``impl``; the fake kernel
     runs the spec fake impl on the :func:`_spec_view`. Both go through
@@ -1012,7 +1012,7 @@ def _register_base_op(
     )
     op.register_fake(_fake)
     _mark_effectful(op)
-    return op
+    return op, _impl
 
 
 def _register_autograd_for_op(
@@ -1116,8 +1116,16 @@ def _flatten_subclass_into_slots(
         new_args[offset + 2] = meta
 
 
+def _fake_mode_active() -> bool:
+    """Whether the call is being traced: a ``FakeTensorMode`` is on the dispatch stack."""
+    return torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE) is not None
+
+
 def _make_slot_forwarder(
-    base_op: Any, slot_offsets: Sequence[int], subclasses: Sequence[type]
+    base_op: Any,
+    kernel: Callable[..., List[torch.Tensor]],
+    slot_offsets: Sequence[int],
+    subclasses: Sequence[type],
 ) -> Callable[[Sequence[Any]], List[torch.Tensor]]:
     """Return ``call(args)`` forwarding to ``base_op``, first flattening any
     ``subclasses`` instance sitting in the tensor-or-quantized slot groups at
@@ -1127,10 +1135,16 @@ def _make_slot_forwarder(
     op body and its ``register_torch_dispatch`` rules all funnel through this one
     path -- see the two-tier op note in the module docstring. With no slots or no
     subclasses to flatten it is a plain pass-through.
+
+    Only a traced call needs the base op: a real call runs ``kernel``, the base
+    op's real kernel, on the wrapper's own arguments, which it takes whole, so
+    nothing is flattened, rebuilt or dispatched a second time per call.
     """
     enabled = bool(slot_offsets) and bool(subclasses)
 
     def call(args: Sequence[Any]) -> List[torch.Tensor]:
+        if not _fake_mode_active():
+            return kernel(*args)
         if not enabled:
             return base_op(*args)
         new_args = list(args)
@@ -1157,15 +1171,12 @@ def _register_wrapper_op(
     *,
     wrapper_op_name: str,
     schema_str: str,
-    base_op: Any,
-    slot_offsets: Sequence[int] = (),
-    subclasses: Sequence[type] = (),
+    forward: Callable[[Sequence[Any]], List[torch.Tensor]],
     tags: Sequence[torch.Tag] = (),
 ) -> Any:
-    """Define the wrapper op via ``torch.library.custom_op``: forward to the base
-    op through :func:`_make_slot_forwarder`. Returns the ``CustomOpDef``.
+    """Define the wrapper op via ``torch.library.custom_op`` over ``forward``, a
+    :func:`_make_slot_forwarder` path. Returns the ``CustomOpDef``.
     """
-    forward = _make_slot_forwarder(base_op, slot_offsets, subclasses)
 
     def _forward(*flat: Any) -> List[torch.Tensor]:
         return forward(flat)
@@ -1234,7 +1245,7 @@ def _register_op(
         if hasattr(namespace, registered_name):
             raise ValueError(f"Custom op '{_TE_OP_NAMESPACE}::{registered_name}' already exists")
 
-    base_def = _register_base_op(
+    base_def, kernel = _register_base_op(
         op_name=f"{name}_base",
         schema_str=schema,
         plan=plan,
@@ -1244,17 +1255,13 @@ def _register_op(
         tags=tags,
     )
     base_op = getattr(namespace, f"{name}_base")
+    forward = _make_slot_forwarder(base_op, kernel, slot_offsets, subclasses)
     wrapper_def = _register_wrapper_op(
-        wrapper_op_name=name,
-        schema_str=schema,
-        base_op=base_op,
-        slot_offsets=slot_offsets,
-        subclasses=subclasses,
-        tags=tags,
+        wrapper_op_name=name, schema_str=schema, forward=forward, tags=tags
     )
     wrapper_op = getattr(namespace, name)
 
-    rule = _make_dispatch_rule(_make_slot_forwarder(base_op, slot_offsets, subclasses))
+    rule = _make_dispatch_rule(forward)
     for sub in subclasses:
         wrapper_def.register_torch_dispatch(sub, rule)
     _quantized_tensor_passthrough_ops.update((base_op.default, wrapper_op.default))
