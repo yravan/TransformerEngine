@@ -2855,6 +2855,66 @@ def test_te_layernorm_output_gradients(module, loss_source, fp8_recipe):
     _assert_close_eager_compiled(fn, compiled, model, base)
 
 
+class _ResidualJoin(torch.autograd.Function):
+    """``x + branch``; the gradient goes to ``branch`` and ``sink``, not to ``x``."""
+
+    @staticmethod
+    def forward(ctx, x, branch, sink):
+        return x + branch
+
+    @staticmethod
+    def backward(ctx, grad):
+        return None, grad, grad
+
+
+@pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
+@pytest.mark.parametrize("module", ["LayerNormLinear", "LayerNormMLP"])
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_te_layernorm_input_grad_sink(module, normalization, compiled):
+    """A residual join routed through the input-grad sink matches the autograd add: the same
+    output, the input gradient within one rounding, and the same parameter gradients."""
+    out_features = 64
+    model = getattr(te, module)(
+        64, 128 if module == "LayerNormMLP" else out_features, normalization=normalization,
+        params_dtype=torch.bfloat16, device="cuda",
+    )  # fmt: skip
+
+    def plain(inp):
+        return inp + model(inp)
+
+    def fused(inp):
+        out, sink = model(inp, return_input_grad_sink=True)
+        return _ResidualJoin.apply(inp, out, sink)
+
+    if compiled:
+        torch._dynamo.reset()
+        fused = torch.compile(fused, fullgraph=True)
+    base = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
+    grad = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
+    results = []
+    for fn in (plain, fused):
+        model.zero_grad(set_to_none=True)
+        inp = base.clone().requires_grad_(True)
+        out = fn(inp)
+        out.backward(grad)
+        results.append((out.detach(), inp.grad, [p.grad.clone() for p in model.parameters()]))
+    (out_a, dx_a, pg_a), (out_b, dx_b, pg_b) = results
+    torch.testing.assert_close(out_b, out_a, rtol=0, atol=0)
+    # The autograd add rounds the norm gradient before adding; the fused kernel rounds once.
+    # They differ by at most one BF16 ulp of the largest of the sum and the two addends.
+    mag = torch.stack(
+        [dx_a.float().abs(), dx_b.float().abs(), (dx_a.float() - grad.float()).abs(), grad.float().abs()]
+    ).amax(0)
+    assert ((dx_b.float() - dx_a.float()).abs() <= torch.exp2(torch.floor(torch.log2(mag)) - 7)).all()
+    for a, b in zip(pg_a, pg_b):
+        torch.testing.assert_close(b, a, rtol=0, atol=0)
+
+    with torch.no_grad():
+        out, sink = model(base, return_input_grad_sink=True)
+    assert sink is None
+
+
 @pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")
 @pytest.mark.parametrize(
     "case", ["linear", "layernorm_linear", "mlp_bias_gelu", "mlp_gemm_gelu", "mlp_swiglu"]

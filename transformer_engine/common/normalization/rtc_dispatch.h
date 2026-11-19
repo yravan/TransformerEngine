@@ -33,13 +33,13 @@ void register_ln_fwd_general(DType wtype, DType itype, DType otype, DType ctype,
 // Register an RTC-backed launcher for a single LayerNorm Backward "tuned" config.
 void register_ln_bwd_tuned(DType wtype, DType itype, DType otype, DType ctype, int hidden_size,
                            int ctas_per_row, int warps_m, int warps_n, int bytes_per_ldg_main,
-                           int bytes_per_ldg_final,
+                           int bytes_per_ldg_final, bool with_add,
                            StaticFallback<BackwardKernelParams> static_fallback = nullptr);
 
 // Register an RTC-backed launcher for a single LayerNorm Backward "general" config.
 void register_ln_bwd_general(DType wtype, DType itype, DType otype, DType ctype, int hidden_size,
                              int warps_m, int warps_n, int bytes_per_ldg_main,
-                             int bytes_per_ldg_final,
+                             int bytes_per_ldg_final, bool with_add,
                              StaticFallback<BackwardKernelParams> static_fallback = nullptr);
 
 // Same set for RMSNorm.
