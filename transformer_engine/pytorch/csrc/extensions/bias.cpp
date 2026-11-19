@@ -35,7 +35,10 @@ void sum_bias_grad(at::Tensor &bias, const at::Tensor &input) {
 
 }  // namespace
 
-std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle quantizer) {
+std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle quantizer,
+                                       const std::optional<at::Tensor> &rope_cos,
+                                       const std::optional<at::Tensor> &rope_sin, int64_t head_dim,
+                                       int64_t rope_cols) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
 
@@ -49,6 +52,11 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   const int64_t bias_size = static_cast<int64_t>(shape.back());
   auto grad_bias_torch = allocateTorchTensor(bias_size, grad_output_dtype);
   auto grad_bias_nvte = makeTransformerEngineTensor(grad_bias_torch);
+
+  const bool with_rope = rope_cos.has_value();
+  NVTE_CHECK(with_rope == rope_sin.has_value(), "rope_cos and rope_sin go together.");
+  NVTE_CHECK(!with_rope || detail::IsMXFP8Quantizers(quantizer.ptr()),
+             "RoPE backward is fused only into the MXFP8 quantize.");
 
   // Unquantized impl only requires computing grad bias
   if (quantizer.is_none()) {
@@ -98,10 +106,23 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   TensorWrapper workspace_nvte;
   at::Tensor workspace_torch;
   auto stream = at::cuda::getCurrentCUDAStream();
-  NVTE_SCOPED_GIL_RELEASE({
-    nvte_quantize_dbias(grad_output_nvte.data(), grad_input_nvte.data(), grad_bias_nvte.data(),
-                        workspace_nvte.data(), stream);
-  });
+  TensorWrapper rope_cos_nvte, rope_sin_nvte;
+  if (with_rope) {
+    rope_cos_nvte = makeTransformerEngineTensor(*rope_cos);
+    rope_sin_nvte = makeTransformerEngineTensor(*rope_sin);
+  }
+  const auto launch = [&]() {
+    if (with_rope) {
+      nvte_quantize_dbias_rope(grad_output_nvte.data(), grad_input_nvte.data(),
+                               grad_bias_nvte.data(), workspace_nvte.data(), rope_cos_nvte.data(),
+                               rope_sin_nvte.data(), static_cast<size_t>(head_dim),
+                               static_cast<size_t>(rope_cols), stream);
+    } else {
+      nvte_quantize_dbias(grad_output_nvte.data(), grad_input_nvte.data(), grad_bias_nvte.data(),
+                          workspace_nvte.data(), stream);
+    }
+  };
+  NVTE_SCOPED_GIL_RELEASE({ launch(); });
 
   // Allocate workspace
   if (workspace_nvte.ndim() > 0 && workspace_nvte.numel() > 0) {
@@ -111,10 +132,7 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   }
 
   // Launch fused kernel
-  NVTE_SCOPED_GIL_RELEASE({
-    nvte_quantize_dbias(grad_output_nvte.data(), grad_input_nvte.data(), grad_bias_nvte.data(),
-                        workspace_nvte.data(), stream);
-  });
+  NVTE_SCOPED_GIL_RELEASE({ launch(); });
 
   return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
 }

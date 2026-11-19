@@ -455,7 +455,10 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
  * Bias gradient fusions
  **************************************************************************************************/
 
-std::vector<py::object> bgrad_quantize(const at::Tensor &input, py::handle py_quantizer);
+std::vector<py::object> bgrad_quantize(const at::Tensor &input, py::handle py_quantizer,
+                                       const std::optional<at::Tensor> &rope_cos,
+                                       const std::optional<at::Tensor> &rope_sin, int64_t head_dim,
+                                       int64_t rope_cols);
 
 std::vector<py::object> dbias_dgelu(const at::Tensor &grad_output, const at::Tensor &act_input,
                                     py::handle quantizer);

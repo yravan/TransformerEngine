@@ -127,6 +127,11 @@ class LayerNormLinearFwdArgs:
     # --- Non-differentiable cached tensors ---
     weight_workspace: Optional[TensorOrQuantized]
 
+    # --- RoPE applied by the caller to the q and k parts of a packed q/k/v output ---
+    rope_cos: Optional[torch.Tensor]
+    rope_sin: Optional[torch.Tensor]
+    rope_head_dim: int
+
     # --- requires_grad flags (cached so backward does not re-query) ---
     input_requires_grad: bool
     ln_weight_requires_grad: bool
@@ -225,6 +230,8 @@ class LayerNormLinearBwdArgs:
     ln_out: Optional[TensorOrQuantized] = None
     mu: Optional[torch.Tensor] = None
     rsigma: Optional[torch.Tensor] = None
+    rope_cos: Optional[torch.Tensor] = None
+    rope_sin: Optional[torch.Tensor] = None
 
     # --- Quantizers ---
     input_quantizer: Optional[Quantizer] = None
@@ -244,6 +251,7 @@ class LayerNormLinearBwdArgs:
     normalization: str = "LayerNorm"
     zero_centered_gamma: bool = False
     bwd_ln_sm_margin: int = 0
+    rope_head_dim: int = 0
     return_layernorm_output: bool = False
     return_layernorm_output_gathered: bool = False
 
@@ -307,6 +315,8 @@ class LayerNormLinearBwdArgs:
             self.ln_out,
             self.mu,
             self.rsigma,
+            self.rope_cos,
+            self.rope_sin,
         ) = restore_from_func_ctx(
             ctx
         )  # pylint: disable=unbalanced-tuple-unpacking
@@ -790,6 +800,7 @@ def _layernorm_linear_setup_ctx(
     bwd_args.normalization = fwd_args.normalization
     bwd_args.zero_centered_gamma = fwd_args.zero_centered_gamma
     bwd_args.bwd_ln_sm_margin = fwd_args.bwd_ln_sm_margin
+    bwd_args.rope_head_dim = fwd_args.rope_head_dim
     bwd_args.return_layernorm_output = fwd_args.return_layernorm_output
     bwd_args.return_layernorm_output_gathered = fwd_args.return_layernorm_output_gathered
 
@@ -903,6 +914,8 @@ def _layernorm_linear_setup_ctx(
         saved_ln_out,
         mu,
         rsigma,
+        fwd_args.rope_cos,
+        fwd_args.rope_sin,
     )
 
 
@@ -2404,6 +2417,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         is_first_microbatch: Optional[bool] = None,
         fp8_output: Optional[bool] = False,
         fp8_grad: Optional[bool] = False,
+        qkv_rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply layer normalization to the input followed by a linear transformation.
@@ -2432,6 +2446,14 @@ class LayerNormLinear(TransformerEngineBaseModule):
                              With ``mode="reduce-overhead"``, call
                              ``torch.compiler.cudagraph_mark_step_begin()`` once before
                              each minibatch to keep the cache live across its microbatches.
+        qkv_rope : (torch.Tensor, torch.Tensor, int), default = None
+                  ``(cos, sin, head_dim)`` when the output is a packed ``(..., 3, heads,
+                  head_dim)`` q/k/v projection to whose q and k parts the caller applies
+                  RoPE without differentiating through it: pairs ``(2i, 2i+1)`` with
+                  ``2i < rot_dim`` rotate by row ``n`` of the FP32 ``[seq_len, rot_dim]``
+                  tables, ``n`` being the token index along the second-to-last input
+                  dimension. The backward pass then rotates the q and k output gradient
+                  back, inside the MXFP8 grad-output quantize when that one runs.
         """
         is_grad_enabled = torch.is_grad_enabled()
 
@@ -2561,6 +2583,9 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 weight=weight_tensor,
                 bias=linear_bias_tensor,
                 weight_workspace=weight_workspace,
+                rope_cos=qkv_rope[0] if qkv_rope is not None else None,
+                rope_sin=qkv_rope[1] if qkv_rope is not None else None,
+                rope_head_dim=qkv_rope[2] if qkv_rope is not None else 0,
                 # requires_grad flags
                 input_requires_grad=inp.requires_grad,
                 ln_weight_requires_grad=self.layer_norm_weight.requires_grad,
